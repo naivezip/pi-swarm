@@ -1,10 +1,24 @@
-# pi-swarm
+# @naivezip/pi-swarm
 
 Multi-agent swarm orchestration package for Pi (`@earendil-works/pi-coding-agent`), providing a shared message board, in-process SDK workers, isolated git workspaces, a stall monitor scheduler, and an interactive TUI board overlay.
 
+## Demo
+
+Recorded live in Pi on WSL using `magpie / workbuddy/deepseek-v4.1-flash` (`math` + `strings` editing disjoint files in parallel, `verifier` extending tests and running `npm test` 11/11 pass, live TUI status widget, and `Alt+S` 3-tab Board Overlay):
+
+![pi-swarm live demo](assets/demo.gif)
+
+[Download / watch full MP4 recording](assets/demo.mp4)
+
 ## Install
 
-Install from GitHub:
+Install from npm:
+
+```bash
+pi install npm:@naivezip/pi-swarm
+```
+
+Or install from GitHub:
 
 ```bash
 pi install git:github.com/naivezip/pi-swarm
