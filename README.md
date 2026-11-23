@@ -1,5 +1,7 @@
 # @naivezip/pi-swarm
 
+From Antigravity native swarm to Pi swarm.
+
 Multi-agent swarm orchestration package for Pi (`@earendil-works/pi-coding-agent`), providing a shared message board, in-process SDK workers, isolated git workspaces, a stall monitor scheduler, and an interactive TUI board overlay.
 
 ## Demo
