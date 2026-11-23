@@ -1,0 +1,47 @@
+{
+	"name": "pi-swarm",
+	"version": "0.1.0",
+	"description": "Native-style multi-agent swarm orchestration package for Pi",
+	"type": "module",
+	"keywords": [
+		"pi-package"
+	],
+	"files": [
+		"extensions",
+		"skills",
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/naivezip/pi-swarm.git"
+	},
+	"homepage": "https://github.com/naivezip/pi-swarm#readme",
+	"bugs": {
+		"url": "https://github.com/naivezip/pi-swarm/issues"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		],
+		"skills": [
+			"./skills"
+		]
+	},
+	"scripts": {
+		"typecheck": "node ../pi/node_modules/typescript/bin/tsc --noEmit",
+		"test": "node ../pi/node_modules/vitest/vitest.mjs run"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"license": "MIT"
+}

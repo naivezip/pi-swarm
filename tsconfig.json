@@ -1,0 +1,59 @@
+{
+	"compilerOptions": {
+		"target": "ES2024",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"lib": ["ES2024"],
+		"strict": true,
+		"erasableSyntaxOnly": true,
+		"verbatimModuleSyntax": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"allowImportingTsExtensions": true,
+		"noEmit": true,
+		"types": ["node"],
+		"typeRoots": ["../pi/node_modules/@types"],
+		"paths": {
+			"@earendil-works/pi-telemetry": ["../pi/packages/telemetry/src/index.ts"],
+			"@earendil-works/pi-telemetry/testing": ["../pi/packages/telemetry/src/testing/index.ts"],
+			"@earendil-works/pi-telemetry/render": ["../pi/packages/telemetry/src/render.ts"],
+			"@earendil-works/pi-codemode": ["../pi/packages/codemode/src/index.ts"],
+			"@earendil-works/pi-codemode/cloudflare": ["../pi/packages/codemode/src/cloudflare.ts"],
+			"@earendil-works/pi-codemode/declarations": ["../pi/packages/codemode/src/declarations.ts"],
+			"@earendil-works/pi-codemode/portable": ["../pi/packages/codemode/src/portable.ts"],
+			"@earendil-works/pi-codemode/source": ["../pi/packages/codemode/src/source.ts"],
+			"@earendil-works/pi-codemode/worker": ["../pi/packages/codemode/src/runtime/worker.ts"],
+			"@earendil-works/pi-schema": ["../pi/packages/schema/src/index.ts"],
+			"@earendil-works/pi-schema/formats": ["../pi/packages/schema/src/formats/index.ts"],
+			"@earendil-works/pi-mcp": ["../pi/packages/mcp/src/index.ts"],
+			"@earendil-works/pi-mcp/oauth": ["../pi/packages/mcp/src/oauth/index.ts"],
+			"@earendil-works/pi-mcp/testing": ["../pi/packages/mcp/src/testing/index.ts"],
+			"@earendil-works/pi-ai": [
+				"../pi/packages/coding-agent/src/core/extensions/pi-ai-extension-view.ts"
+			],
+			"@earendil-works/pi-ai/compat": ["../pi/packages/ai/src/compat.ts"],
+			"@earendil-works/pi-ai/models": ["../pi/packages/ai/src/models.ts"],
+			"@earendil-works/pi-ai/oauth": ["../pi/packages/ai/src/oauth.ts"],
+			"@earendil-works/pi-ai/*": ["../pi/packages/ai/src/*.ts", "../pi/packages/ai/src/providers/*.ts"],
+			"@earendil-works/pi-env": ["../pi/packages/env/src/index.ts"],
+			"@earendil-works/pi-agent-core": ["../pi/packages/agent/src/index.ts"],
+			"@earendil-works/pi-coding-agent": ["../pi/packages/coding-agent/src/index.ts"],
+			"@earendil-works/pi-coding-agent/*": ["../pi/packages/coding-agent/src/*"],
+			"@earendil-works/pi-tui": ["../pi/packages/tui/src/index.ts"],
+			"@earendil-works/pi-tui/*": ["../pi/packages/tui/src/*"],
+			"typebox": ["../pi/node_modules/typebox/build/index.d.mts"],
+			"typebox/*": ["../pi/node_modules/typebox/build/*/index.d.mts"],
+			"vitest": ["../pi/node_modules/vitest/dist/index.d.ts"]
+		}
+	},
+	"include": [
+		"src/**/*.ts",
+		"extensions/**/*.ts",
+		"test/**/*.ts",
+		"../pi/packages/coding-agent/src/**/*.d.ts",
+		"../pi/packages/tui/src/**/*.d.ts"
+	],
+	"exclude": ["node_modules", "dist"]
+}
