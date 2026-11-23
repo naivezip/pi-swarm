@@ -31,6 +31,10 @@
 		"image": "https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo-overview.png",
 		"video": "https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo.mp4"
 	},
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
 	"scripts": {
 		"typecheck": "node ../pi/node_modules/typescript/bin/tsc --noEmit",
 		"test": "node ../pi/node_modules/vitest/vitest.mjs run"

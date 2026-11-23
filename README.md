@@ -8,9 +8,9 @@ Multi-agent swarm orchestration package for Pi (`@earendil-works/pi-coding-agent
 
 Recorded live in Pi on WSL using `magpie / workbuddy/deepseek-v4.1-flash` (`math` + `strings` editing disjoint files in parallel, `verifier` extending tests and running `npm test` 11/11 pass, live TUI status widget, and `Alt+S` 3-tab Board Overlay):
 
-![pi-swarm live demo](assets/demo.gif)
+![pi-swarm live demo](https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo.gif)
 
-[Download / watch full MP4 recording](assets/demo.mp4)
+[Download / watch full MP4 recording](https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo.mp4)
 
 ## Install
 
