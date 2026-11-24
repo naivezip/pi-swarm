@@ -9,7 +9,9 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import type { SwarmManager } from "./runtime.ts";
 import {
+	type BackgroundProcessSummary,
 	isMonitorName,
+	type ManageProcessResult,
 	type ManageTaskResult,
 	type ScheduleResult,
 	type SwarmPlan,
@@ -105,12 +107,49 @@ export const ManageTaskToolParams = Type.Object({
 
 export type ManageTaskToolInput = Static<typeof ManageTaskToolParams>;
 
+export const BashToolParams = Type.Object({
+	command: Type.String({ description: "Shell command to execute" }),
+	wait_ms: Type.Optional(
+		Type.Integer({
+			minimum: 0,
+			maximum: 30000,
+			description: "Max milliseconds to wait synchronously before promoting to background (default 10000, max 30000)",
+		}),
+	),
+	is_daemon: Type.Optional(
+		Type.Boolean({
+			description: "Mark long-lived dev server/watcher as a daemon (suppresses still-running reminder wakes)",
+		}),
+	),
+	notify_after_seconds: Type.Optional(
+		Type.Number({
+			exclusiveMinimum: 0,
+			description: "For non-daemon processes, seconds after backgrounding before a still-running reminder wake fires (default 120)",
+		}),
+	),
+});
+
+export type BashToolInput = Static<typeof BashToolParams>;
+
+export const ManageProcessToolParams = Type.Object({
+	action: StringEnum(["list", "status", "send_input", "kill"] as const, {
+		description: "Background process management action",
+	}),
+	task_id: Type.Optional(
+		Type.String({ description: "Target background process task ID (required for status, send_input, kill)" }),
+	),
+	input: Type.Optional(Type.String({ description: "UTF-8 stdin payload to write when action is send_input" })),
+});
+
+export type ManageProcessToolInput = Static<typeof ManageProcessToolParams>;
+
 export interface CreateSwarmToolsOptions {
 	getManager: () => SwarmManager | undefined;
 	ensureManager?: (ctx: ExtensionContext) => SwarmManager;
 	callerName: string | (() => string);
 	defaultActive?: boolean;
 	includeMonitorTools?: boolean;
+	includeWorkerProcessTools?: boolean;
 }
 
 export interface SwarmToolDefinitions {
@@ -120,6 +159,8 @@ export interface SwarmToolDefinitions {
 	swarm_wait: ToolDefinition<typeof SwarmWaitToolParams>;
 	schedule?: ToolDefinition<typeof ScheduleToolParams>;
 	manage_task?: ToolDefinition<typeof ManageTaskToolParams>;
+	bash?: ToolDefinition<typeof BashToolParams>;
+	manage_process?: ToolDefinition<typeof ManageProcessToolParams>;
 	all: ToolDefinition[];
 }
 
@@ -130,12 +171,16 @@ function resolveCaller(callerName: string | (() => string)): string {
 function resolveManager(options: CreateSwarmToolsOptions, ctx: ExtensionContext): SwarmManager {
 	const existing = options.getManager();
 	if (existing) {
-		existing.updateHostContext(ctx);
+		if (resolveCaller(options.callerName) === "coordinator") {
+			existing.updateHostContext(ctx);
+		}
 		return existing;
 	}
 	if (options.ensureManager) {
 		const created = options.ensureManager(ctx);
-		created.updateHostContext(ctx);
+		if (resolveCaller(options.callerName) === "coordinator") {
+			created.updateHostContext(ctx);
+		}
 		return created;
 	}
 	throw new Error("Swarm is not active. Start a swarm with /swarm <task> first.");
@@ -154,6 +199,23 @@ function formatTimestamp(ms: number): string {
 	const mm = String(d.getMinutes()).padStart(2, "0");
 	const ss = String(d.getSeconds()).padStart(2, "0");
 	return `${hh}:${mm}:${ss}`;
+}
+
+function formatDurationMs(ms: number): string {
+	if (ms < 1000) {
+		return `${Math.max(0, Math.round(ms))}ms`;
+	}
+	const secs = ms / 1000;
+	if (secs < 60) {
+		return `${secs.toFixed(1)}s`;
+	}
+	const mins = Math.floor(secs / 60);
+	const remSecs = Math.round(secs % 60);
+	return `${mins}m${remSecs}s`;
+}
+
+function formatProcessSummaryLine(p: BackgroundProcessSummary): string {
+	return `${p.taskId} | daemon=${p.isDaemon} | elapsed=${formatDurationMs(p.elapsedMs)} | silent=${formatDurationMs(p.silentMs)} | cmd="${p.commandPreview}"`;
 }
 
 function renderSimpleText(text: string, lastComponent: unknown): Text {
@@ -181,6 +243,7 @@ function formatSwarmStatus(manager: SwarmManager): string {
 	} else {
 		lines.push("Members:");
 		for (const m of status.members) {
+			const bgProcs = m.backgroundProcesses ?? [];
 			const parts = [
 				`${m.name}`,
 				`state=${m.state}`,
@@ -194,9 +257,13 @@ function formatSwarmStatus(manager: SwarmManager): string {
 				m.unreadCount > 0 ? `unread=${m.unreadCount}` : undefined,
 				m.lastPostSeq !== undefined ? `lastPost=#${m.lastPostSeq}` : undefined,
 				m.currentActivity ? `activity="${m.currentActivity}"` : undefined,
+				bgProcs.length > 0 ? `bg=${bgProcs.length}` : undefined,
 				m.lastError ? `error="${m.lastError}"` : undefined,
 			].filter((p): p is string => p !== undefined);
 			lines.push(`- ${parts.join(" | ")}`);
+			for (const p of bgProcs) {
+				lines.push(`  - bg ${formatProcessSummaryLine(p)}`);
+			}
 		}
 	}
 	return lines.join("\n");
@@ -221,6 +288,7 @@ function formatDetailedStatusForMonitor(manager: SwarmManager): string {
 		lines.push("- (none)");
 	} else {
 		for (const m of status.members) {
+			const bgProcs = m.backgroundProcesses ?? [];
 			const lastPost =
 				m.lastPostSeq !== undefined
 					? `lastPost=#${m.lastPostSeq}@${formatTimestamp(m.lastPostTime ?? 0)}`
@@ -229,8 +297,11 @@ function formatDetailedStatusForMonitor(manager: SwarmManager): string {
 			lines.push(
 				`- ${m.name} | state=${m.state} | wake=${m.wakeMode}(since=#${m.waitSince}) | lastRead=#${m.lastReadSeq} | unread=${m.unreadCount} | ${lastPost} | channels=${chStr}${
 					m.currentActivity ? ` | activity=${m.currentActivity}` : ""
-				}${m.lastError ? ` | error=${m.lastError}` : ""}`,
+				}${bgProcs.length > 0 ? ` | bg=${bgProcs.length}` : ""}${m.lastError ? ` | error=${m.lastError}` : ""}`,
 			);
+			for (const p of bgProcs) {
+				lines.push(`  - bg ${formatProcessSummaryLine(p)}`);
+			}
 		}
 	}
 	return lines.join("\n");
@@ -640,14 +711,176 @@ export function createManageTaskTool(options: CreateSwarmToolsOptions): ToolDefi
 	};
 }
 
+/** Creates the worker async-backgrounding `bash` tool definition. */
+export function createAsyncBashTool(options: CreateSwarmToolsOptions): ToolDefinition<typeof BashToolParams> {
+	const defaultActive = options.defaultActive ?? true;
+	return {
+		name: "bash",
+		label: "Bash",
+		description:
+			"Execute a shell command in your workspace. Commands finishing within wait_ms (default 10000ms, max 30000ms) return synchronously; slower commands automatically promote to the background without being killed and return a taskId. Do NOT poll in a loop — end your turn to await async process_exit / process_still_running wakes (use is_daemon: true for servers/watchers and kill them when done).",
+		promptSnippet: "Run shell commands with automatic background promotion for long-running tasks",
+		defaultActive,
+		parameters: BashToolParams,
+		async execute(
+			_toolCallId: string,
+			params: BashToolInput,
+			_signal: AbortSignal | undefined,
+			_onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+			ctx: ExtensionToolContext,
+		) {
+			const caller = resolveCaller(options.callerName);
+			if (caller === "coordinator" || isMonitorName(caller)) {
+				throw new Error(`Worker async bash tool cannot be used by "${caller}".`);
+			}
+			const manager = resolveManager(options, ctx);
+			const result = await manager.runWorkerBash(caller, params);
+
+			if (result.status === "exited") {
+				const header = `Command exited with code ${result.exitCode}${
+					result.signal ? ` (signal ${result.signal})` : ""
+				} in ${formatDurationMs(result.elapsedMs)}.`;
+				const lines = [
+					header,
+					result.fullOutputPath ? `Full output log: ${result.fullOutputPath}` : undefined,
+					result.outputTail ? result.outputTail : "(no output)",
+				].filter((line): line is string => line !== undefined);
+				const formatted = formatTextResult(lines.join("\n"), { ...result });
+				if (result.exitCode !== 0) {
+					return { ...formatted, isError: true };
+				}
+				return formatted;
+			}
+
+			const lines = [
+				`Command still running after ${formatDurationMs(result.elapsedMs)} — promoted to background as ${result.taskId}${
+					result.isDaemon ? " (daemon)" : ""
+				}.`,
+				result.isDaemon
+					? `Daemon mode is enabled (reminder wakes suppressed). Terminate ${result.taskId} with manage_process({ action: "kill", task_id: "${result.taskId}" }) when finished.`
+					: `Do NOT poll manage_process in a loop. End your turn to wait for the async process_exit wake (or a process_still_running reminder after ${result.notifyAfterSeconds ?? 120}s), or continue with other work.`,
+				result.fullOutputPath ? `Full output log: ${result.fullOutputPath}` : undefined,
+				`Output tail so far${result.truncated ? " (truncated)" : ""}:`,
+				result.outputTail ? result.outputTail : "(no output yet)",
+			].filter((line): line is string => line !== undefined);
+
+			return formatTextResult(lines.join("\n"), { ...result });
+		},
+		renderCall(args, theme, context) {
+			const collapsed = args.command.replace(/\s+/g, " ").trim();
+			const preview = collapsed.length > 72 ? `${collapsed.slice(0, 69)}...` : collapsed;
+			const flags = [
+				args.is_daemon ? "daemon" : undefined,
+				args.wait_ms !== undefined ? `wait=${args.wait_ms}ms` : undefined,
+			].filter((f): f is string => f !== undefined);
+			const suffix = flags.length > 0 ? theme.fg("dim", ` [${flags.join(", ")}]`) : "";
+			return renderSimpleText(
+				`${theme.fg("toolTitle", theme.bold("bash"))} ${theme.fg("muted", preview)}${suffix}`,
+				context.lastComponent,
+			);
+		},
+		renderResult(result, opt, theme, context) {
+			const text = extractResultText(result);
+			const lines = text.split("\n");
+			const preview = opt.expanded
+				? text
+				: lines.slice(0, 8).join("\n") + (lines.length > 8 ? `\n... (${lines.length - 8} more lines)` : "");
+			const color = context.isError ? "error" : "toolOutput";
+			return renderSimpleText(theme.fg(color, preview), context.lastComponent);
+		},
+	};
+}
+
+/** Creates the worker `manage_process` tool definition (`list`, `status`, `send_input`, `kill`). */
+export function createManageProcessTool(options: CreateSwarmToolsOptions): ToolDefinition<typeof ManageProcessToolParams> {
+	const defaultActive = options.defaultActive ?? true;
+	return {
+		name: "manage_process",
+		label: "Manage Process",
+		description:
+			'Manage your own background shell processes: "list" active processes, inspect "status" and output tail, "send_input" to stdin, or "kill" a process tree.',
+		promptSnippet: "List, inspect, send stdin to, or kill your background shell processes",
+		defaultActive,
+		parameters: ManageProcessToolParams,
+		async execute(
+			_toolCallId: string,
+			params: ManageProcessToolInput,
+			_signal: AbortSignal | undefined,
+			_onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+			ctx: ExtensionToolContext,
+		) {
+			const caller = resolveCaller(options.callerName);
+			if (caller === "coordinator" || isMonitorName(caller)) {
+				throw new Error(`Tool "manage_process" cannot be used by "${caller}".`);
+			}
+			const manager = resolveManager(options, ctx);
+			const result: ManageProcessResult = await manager.manageWorkerProcess(caller, params);
+
+			switch (result.kind) {
+				case "list": {
+					if (result.processes.length === 0) {
+						return formatTextResult("No active background processes.", { ...result });
+					}
+					const lines = result.processes.map((p) => `- ${formatProcessSummaryLine(p)}`);
+					return formatTextResult(lines.join("\n"), { ...result });
+				}
+				case "status": {
+					const p = result.process;
+					const lines = [
+						`${p.taskId} | state=${p.state}${p.isDaemon ? " [daemon]" : ""}${
+							p.exitCode !== undefined ? ` | exitCode=${p.exitCode}` : ""
+						} | elapsed=${formatDurationMs(p.elapsedMs)} | silent=${formatDurationMs(p.silentMs)}`,
+						`Command: ${p.command}`,
+						p.fullOutputPath ? `Full output log: ${p.fullOutputPath}` : undefined,
+						`Output tail${p.truncated ? " (truncated)" : ""} (${p.totalBytes} bytes):`,
+						p.outputTail ? p.outputTail : "(no output)",
+					].filter((line): line is string => line !== undefined);
+					return formatTextResult(lines.join("\n"), { ...result });
+				}
+				case "send_input": {
+					return formatTextResult(
+						`Sent ${result.bytesWritten} bytes to stdin of background process ${result.taskId}.`,
+						{ ...result },
+					);
+				}
+				case "kill": {
+					return formatTextResult(
+						result.killed
+							? `Killed background process ${result.taskId} (${result.summary.commandPreview}).`
+							: `Background process ${result.taskId} was already ${result.summary.state}.`,
+						{ ...result },
+					);
+				}
+			}
+		},
+		renderCall(args, theme, context) {
+			const detail = args.task_id ? ` ${args.task_id}` : "";
+			return renderSimpleText(
+				`${theme.fg("toolTitle", theme.bold("manage_process"))}${theme.fg("accent", ` ${args.action}`)}${theme.fg("muted", detail)}`,
+				context.lastComponent,
+			);
+		},
+		renderResult(result, opt, theme, context) {
+			const text = extractResultText(result);
+			const lines = text.split("\n");
+			const preview = opt.expanded
+				? text
+				: lines.slice(0, 8).join("\n") + (lines.length > 8 ? `\n... (${lines.length - 8} more lines)` : "");
+			const color = context.isError ? "error" : "toolOutput";
+			return renderSimpleText(theme.fg(color, preview), context.lastComponent);
+		},
+	};
+}
+
 /** Builds the complete swarm tool set for either coordinator or worker sessions. */
 export function createSwarmToolDefinitions(options: CreateSwarmToolsOptions): SwarmToolDefinitions {
 	const swarm = createSwarmTool(options);
 	const post_message = createPostMessageTool(options);
 	const read_board = createReadBoardTool(options);
 	const swarm_wait = createSwarmWaitTool(options);
-	const includeMonitor =
-		options.includeMonitorTools ?? isMonitorName(resolveCaller(options.callerName));
+	const caller = resolveCaller(options.callerName);
+	const includeMonitor = options.includeMonitorTools ?? isMonitorName(caller);
+	const includeWorkerProcess = Boolean(options.includeWorkerProcessTools) && !includeMonitor && !isMonitorName(caller);
 
 	if (includeMonitor) {
 		const schedule = createScheduleTool(options);
@@ -660,6 +893,20 @@ export function createSwarmToolDefinitions(options: CreateSwarmToolsOptions): Sw
 			schedule,
 			manage_task,
 			all: [swarm, post_message, read_board, swarm_wait, schedule, manage_task],
+		};
+	}
+
+	if (includeWorkerProcess) {
+		const bash = createAsyncBashTool(options);
+		const manage_process = createManageProcessTool(options);
+		return {
+			swarm,
+			post_message,
+			read_board,
+			swarm_wait,
+			bash,
+			manage_process,
+			all: [swarm, post_message, read_board, swarm_wait, bash, manage_process],
 		};
 	}
 

@@ -15,7 +15,9 @@ import { Value } from "typebox/value";
 import { afterEach, describe, expect, it } from "vitest";
 import { type CreateWorkerSessionContext, SwarmManager, type WorkerSessionHandle } from "../src/runtime.ts";
 import {
+	BashToolParams,
 	createSwarmToolDefinitions,
+	ManageProcessToolParams,
 	ManageTaskToolParams,
 	PostMessageToolParams,
 	ReadBoardToolParams,
@@ -323,5 +325,233 @@ describe("swarm tool execution and rendering", () => {
 		expect(coordTools.swarm_wait.renderCall!({ since: 1 }, mockTheme, makeRenderCtx({ since: 1 })).render(80)[0]).toContain("swarm_wait");
 		expect(monTools.schedule!.renderCall!({ CronExpression: "*/3 * * * *", Prompt: "tick" }, mockTheme, makeRenderCtx({ CronExpression: "*/3 * * * *", Prompt: "tick" })).render(80)[0]).toContain("schedule");
 		expect(monTools.manage_task!.renderCall!({ Action: "list" }, mockTheme, makeRenderCtx({ Action: "list" })).render(80)[0]).toContain("manage_task");
+	});
+
+	it("registers worker async bash and manage_process tools and excludes them from monitor", () => {
+		const workerTools = createSwarmToolDefinitions({
+			getManager: () => undefined,
+			callerName: "verifier",
+			defaultActive: true,
+			includeWorkerProcessTools: true,
+		});
+		expect(workerTools.all.map((t) => t.name)).toEqual([
+			"swarm",
+			"post_message",
+			"read_board",
+			"swarm_wait",
+			"bash",
+			"manage_process",
+		]);
+		expect(workerTools.bash).toBeDefined();
+		expect(workerTools.manage_process).toBeDefined();
+		expect(workerTools.schedule).toBeUndefined();
+
+		const monitorTools = createSwarmToolDefinitions({
+			getManager: () => undefined,
+			callerName: "monitor",
+			defaultActive: true,
+			includeWorkerProcessTools: true,
+		});
+		expect(monitorTools.all.map((t) => t.name)).toEqual([
+			"swarm",
+			"post_message",
+			"read_board",
+			"swarm_wait",
+			"schedule",
+			"manage_task",
+		]);
+		expect(monitorTools.bash).toBeUndefined();
+		expect(monitorTools.manage_process).toBeUndefined();
+
+		expect(Value.Check(BashToolParams, { command: "echo hi", wait_ms: 5000, is_daemon: false, notify_after_seconds: 10 })).toBe(true);
+		expect(Value.Check(BashToolParams, { command: "echo hi", wait_ms: 45000 })).toBe(false);
+		expect(Value.Check(BashToolParams, { command: "echo hi", notify_after_seconds: 0 })).toBe(false);
+		expect(Value.Check(ManageProcessToolParams, { action: "list" })).toBe(true);
+		expect(Value.Check(ManageProcessToolParams, { action: "send_input", task_id: "proc-1", input: "hello\n" })).toBe(true);
+		expect(Value.Check(ManageProcessToolParams, { action: "invalid" })).toBe(false);
+	});
+
+	it("executes async bash, manage_process loop, isolation, status formatting, and renderers", async () => {
+		const cwd = makeTempDir("pi-tools-proc-cwd-");
+		const swarmsRoot = makeTempDir("pi-tools-proc-root-");
+		const m1 = makeModel("p", "m1");
+		const ctx = makeToolContext(cwd, [m1]);
+
+		const manager = new SwarmManager({
+			sessionId: "sess-tools-proc",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (wCtx) => makeFakeSession(wCtx),
+		});
+		managersToDispose.push(manager);
+
+		await manager.addWorkers({ name: "alpha", brief: "Alpha work" }, "coordinator", ctx);
+		await manager.addWorkers({ name: "beta", brief: "Beta work" }, "coordinator", ctx);
+		await manager.addWorkers({ name: "monitor", brief: "Monitor" }, "coordinator", ctx);
+
+		const coordTools = createSwarmToolDefinitions({
+			getManager: () => manager,
+			callerName: "coordinator",
+			defaultActive: false,
+		});
+		const alphaTools = createSwarmToolDefinitions({
+			getManager: () => manager,
+			callerName: "alpha",
+			defaultActive: true,
+			includeWorkerProcessTools: true,
+		});
+		const betaTools = createSwarmToolDefinitions({
+			getManager: () => manager,
+			callerName: "beta",
+			defaultActive: true,
+			includeWorkerProcessTools: true,
+		});
+		const monitorTools = createSwarmToolDefinitions({
+			getManager: () => manager,
+			callerName: "monitor",
+			defaultActive: true,
+			includeMonitorTools: true,
+		});
+
+		// Sync fast command
+		const fastRes = await alphaTools.bash!.execute(
+			"b1",
+			{ command: `node -e "console.log('fast-ok')"`, wait_ms: 5000 },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect((fastRes.content[0] as { text: string }).text).toContain("Command exited with code 0");
+		expect((fastRes.content[0] as { text: string }).text).toContain("fast-ok");
+		expect((fastRes.details as { status: string }).status).toBe("exited");
+
+		// Sync non-zero command marks isError
+		const failRes = await alphaTools.bash!.execute(
+			"b2",
+			{ command: `node -e "console.error('boom'); process.exit(3)"`, wait_ms: 5000 },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect((failRes as { isError?: boolean }).isError).toBe(true);
+		expect((failRes.content[0] as { text: string }).text).toContain("code 3");
+
+		// Slow interactive command promotes to background at wait_ms
+		const slowCmd = `node -e "console.log('booting'); process.stdin.setEncoding('utf8'); process.stdin.on('data', d => { process.stdout.write('echo:' + d.trim() + '\\n'); if (d.trim() === 'quit') process.exit(0); }); setInterval(() => {}, 1000);"`;
+		const bgRes = await alphaTools.bash!.execute(
+			"b3",
+			{ command: slowCmd, wait_ms: 150, is_daemon: true },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const bgText = (bgRes.content[0] as { text: string }).text;
+		const bgDetails = bgRes.details as { status: string; taskId: string; isDaemon: boolean };
+		expect(bgDetails.status).toBe("running");
+		expect(bgDetails.isDaemon).toBe(true);
+		expect(bgText).toContain(bgDetails.taskId);
+		expect(bgText).toContain("Daemon mode is enabled");
+
+		// Non-daemon promotion returns no-polling instruction
+		const nonDaemonCmd = `node -e "setTimeout(() => process.exit(0), 2000)"`;
+		const ndRes = await alphaTools.bash!.execute(
+			"b4",
+			{ command: nonDaemonCmd, wait_ms: 80, notify_after_seconds: 10 },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const ndText = (ndRes.content[0] as { text: string }).text;
+		const ndDetails = ndRes.details as { status: string; taskId: string };
+		expect(ndText).toContain("Do NOT poll manage_process in a loop");
+
+		// swarm{action:"status"} and read_board{status:true} both show active background processes
+		const coordStatusText = (
+			(await coordTools.swarm.execute("s1", { action: "status" }, undefined, undefined, ctx)).content[0] as { text: string }
+		).text;
+		expect(coordStatusText).toContain(bgDetails.taskId);
+		expect(coordStatusText).toContain("daemon=true");
+		expect(coordStatusText).toContain(ndDetails.taskId);
+		expect(coordStatusText).toContain("daemon=false");
+
+		const monStatusText = (
+			(await monitorTools.read_board.execute("m1", { status: true }, undefined, undefined, ctx)).content[0] as { text: string }
+		).text;
+		expect(monStatusText).toContain(bgDetails.taskId);
+		expect(monStatusText).toContain("daemon=true");
+		expect(monStatusText).toContain("elapsed=");
+		expect(monStatusText).toContain("silent=");
+
+		// manage_process: list, send_input, status, kill
+		const listRes = await alphaTools.manage_process!.execute("p1", { action: "list" }, undefined, undefined, ctx);
+		expect((listRes.content[0] as { text: string }).text).toContain(bgDetails.taskId);
+
+		const sendRes = await alphaTools.manage_process!.execute(
+			"p2",
+			{ action: "send_input", task_id: bgDetails.taskId, input: "hello\n" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect((sendRes.content[0] as { text: string }).text).toContain("Sent 6 bytes");
+
+		await new Promise((r) => setTimeout(r, 120));
+		const statRes = await alphaTools.manage_process!.execute(
+			"p3",
+			{ action: "status", task_id: bgDetails.taskId },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect((statRes.content[0] as { text: string }).text).toContain("echo:hello");
+
+		// Cross-worker isolation enforced
+		await expect(
+			betaTools.manage_process!.execute("p4", { action: "status", task_id: bgDetails.taskId }, undefined, undefined, ctx),
+		).rejects.toThrow(/Permission denied/);
+		await expect(
+			betaTools.manage_process!.execute("p5", { action: "kill", task_id: bgDetails.taskId }, undefined, undefined, ctx),
+		).rejects.toThrow(/Permission denied/);
+
+		// Kill both processes
+		const killBg = await alphaTools.manage_process!.execute(
+			"p6",
+			{ action: "kill", task_id: bgDetails.taskId },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect((killBg.content[0] as { text: string }).text).toContain(`Killed background process ${bgDetails.taskId}`);
+		await alphaTools.manage_process!.execute("p7", { action: "kill", task_id: ndDetails.taskId }, undefined, undefined, ctx);
+
+		// RenderCall & RenderResult smoke checks for bash and manage_process
+		const mockTheme = {
+			fg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		} as unknown as Theme;
+		expect(
+			alphaTools.bash!
+				.renderCall!(
+					{ command: "npm test", wait_ms: 5000, is_daemon: true },
+					mockTheme,
+					makeRenderCtx({ command: "npm test", wait_ms: 5000, is_daemon: true }),
+				)
+				.render(80)[0],
+		).toContain("bash");
+		expect(
+			alphaTools.bash!
+				.renderResult!(bgRes, { expanded: false, isPartial: false }, mockTheme, makeRenderCtx({ command: slowCmd }))
+				.render(80)[0],
+		).toContain(bgDetails.taskId);
+		expect(
+			alphaTools.manage_process!
+				.renderCall!({ action: "kill", task_id: bgDetails.taskId }, mockTheme, makeRenderCtx({ action: "kill", task_id: bgDetails.taskId }))
+				.render(80)[0],
+		).toContain("manage_process");
+		expect(
+			alphaTools.manage_process!
+				.renderResult!(killBg, { expanded: false, isPartial: false }, mockTheme, makeRenderCtx({ action: "kill", task_id: bgDetails.taskId }))
+				.render(80)[0],
+		).toContain("Killed background process");
 	});
 });

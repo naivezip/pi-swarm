@@ -11,7 +11,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { ModelInfoEntry, SwarmManager, SwarmSnapshot } from "./runtime.ts";
-import type { BoardMessage, MemberState, MemberStatusSummary } from "./types.ts";
+import type { BackgroundProcessSummary, BoardMessage, MemberState, MemberStatusSummary } from "./types.ts";
 
 export const SWARM_WIDGET_KEY = "pi-swarm";
 
@@ -64,6 +64,107 @@ export function formatTimeShort(ms: number): string {
 	const mm = String(d.getMinutes()).padStart(2, "0");
 	const ss = String(d.getSeconds()).padStart(2, "0");
 	return `${hh}:${mm}:${ss}`;
+}
+
+/** Formats a millisecond duration compactly (e.g. `450ms`, `12.3s`, `1m5s`, `1h2m`). */
+export function formatDurationShort(ms: number): string {
+	const clamped = Math.max(0, ms);
+	if (clamped < 1000) {
+		return `${Math.round(clamped)}ms`;
+	}
+	const secs = clamped / 1000;
+	if (secs < 59.95) {
+		return `${secs.toFixed(1)}s`;
+	}
+	const totalSecs = Math.round(secs);
+	const mins = Math.floor(totalSecs / 60);
+	const remSecs = totalSecs % 60;
+	if (mins < 60) {
+		return `${mins}m${remSecs}s`;
+	}
+	const hours = Math.floor(mins / 60);
+	const remMins = mins % 60;
+	return `${hours}h${remMins}m`;
+}
+
+function getActiveMemberProcesses(
+	snapshot: SwarmSnapshot,
+	member: MemberStatusSummary,
+): BackgroundProcessSummary[] {
+	const fromMember = member.backgroundProcesses ?? [];
+	const fromSnapshot = (snapshot.backgroundProcesses ?? []).filter((p) => p.ownerWorker === member.name);
+	const source = fromMember.length > 0 ? fromMember : fromSnapshot;
+	return source.filter((p) => p.state === "running");
+}
+
+function getTotalActiveBackgroundProcesses(snapshot: SwarmSnapshot): number {
+	const seen = new Set<string>();
+	for (const p of snapshot.backgroundProcesses ?? []) {
+		if (p.state === "running") {
+			seen.add(p.taskId);
+		}
+	}
+	for (const m of snapshot.members) {
+		for (const p of m.backgroundProcesses ?? []) {
+			if (p.state === "running") {
+				seen.add(p.taskId);
+			}
+		}
+	}
+	return seen.size;
+}
+
+function formatBgCommandPreview(proc: BackgroundProcessSummary, maxLen = 28): string {
+	const clean = (proc.commandPreview || proc.command).replace(/\s+/g, " ").trim();
+	return clean.length > maxLen ? `${clean.slice(0, Math.max(1, maxLen - 3))}...` : clean;
+}
+
+function formatWidgetBgSummary(procs: readonly BackgroundProcessSummary[], theme: Theme): string {
+	const primary = procs[0]!;
+	const daemonTag = primary.isDaemon ? "[daemon] " : "";
+	const preview = formatBgCommandPreview(primary, 26);
+	const more = procs.length > 1 ? ` +${procs.length - 1}` : "";
+	const dur = formatDurationShort(primary.elapsedMs);
+	const countText = theme.fg("accent", `${procs.length} bg`);
+	const detailText = theme.fg("muted", `(${daemonTag}${preview}${more}, ${dur})`);
+	return `${countText} ${detailText}`;
+}
+
+function formatOverlayBgBadge(procs: readonly BackgroundProcessSummary[], theme: Theme): string {
+	const primary = procs[0]!;
+	const daemonTag = primary.isDaemon ? "[daemon] " : "";
+	const preview = formatBgCommandPreview(primary, 20);
+	const more = procs.length > 1 ? ` +${procs.length - 1}` : "";
+	return theme.fg(
+		"accent",
+		`[${procs.length} bg: ${daemonTag}${preview}${more} ${formatDurationShort(primary.elapsedMs)}]`,
+	);
+}
+
+function formatBackgroundProcessDetailLines(
+	procs: readonly BackgroundProcessSummary[],
+	paneWidth: number,
+	theme: Theme,
+): string[] {
+	const lines: string[] = [
+		` ${theme.fg("accent", theme.bold(`Background Processes (${procs.length}):`))}`,
+	];
+	for (const p of procs) {
+		const daemonTag = p.isDaemon ? ` ${theme.fg("warning", "[daemon]")}` : "";
+		const prefix = `   ${theme.fg("accent", p.taskId)}${daemonTag}`;
+		const timingPlain = `(elapsed ${formatDurationShort(p.elapsedMs)}, silent ${formatDurationShort(p.silentMs)})`;
+		const timing = theme.fg("dim", timingPlain);
+		const cmd = (p.commandPreview || p.command).replace(/\s+/g, " ").trim();
+		const cmdBudget = paneWidth - visibleWidth(prefix) - 1 - timingPlain.length - 1;
+		if (cmdBudget >= 18) {
+			const fittedCmd = truncateToWidth(cmd, cmdBudget);
+			lines.push(`${prefix} ${fittedCmd} ${timing}`);
+		} else {
+			lines.push(truncateToWidth(`${prefix} ${cmd}`, paneWidth));
+			lines.push(truncateToWidth(`     ${timing}`, paneWidth));
+		}
+	}
+	return lines;
 }
 
 function getStateColor(state: MemberState): ThemeColor {
@@ -144,16 +245,24 @@ export function renderSwarmPlainSummary(snapshot: SwarmSnapshot): string {
 		lines.push("  (none)");
 	} else {
 		for (const m of snapshot.members) {
+			const bgProcs = getActiveMemberProcesses(snapshot, m);
 			const parts = [
 				`${m.name} [${m.state}]`,
 				m.model ? `model=${m.model}` : undefined,
 				`ws=${m.workspaceMode}`,
 				`tok=${formatTokenCount(m.usage.input)}/${formatTokenCount(m.usage.output)}`,
 				formatCost(m.usage.cost),
+				bgProcs.length > 0 ? `bg=${bgProcs.length}` : undefined,
 				m.currentActivity ? `activity="${m.currentActivity}"` : undefined,
 				m.lastError ? `error="${m.lastError}"` : undefined,
 			].filter((p): p is string => p !== undefined);
 			lines.push(`  - ${parts.join(" | ")}`);
+			for (const p of bgProcs) {
+				const daemonTag = p.isDaemon ? " [daemon]" : "";
+				lines.push(
+					`    * ${p.taskId}${daemonTag} ${p.commandPreview || p.command} (elapsed ${formatDurationShort(p.elapsedMs)}, silent ${formatDurationShort(p.silentMs)})`,
+				);
+			}
 		}
 	}
 
@@ -187,8 +296,10 @@ export function renderSwarmWidgetLines(
 	const activeChannelCount = snapshot.channels.filter((c) => !c.archived).length;
 	const totalTokens = formatTokenCount(snapshot.totals.input + snapshot.totals.output);
 	const totalCost = formatCost(snapshot.totals.cost);
+	const totalBgCount = getTotalActiveBackgroundProcesses(snapshot);
+	const bgHeaderPart = totalBgCount > 0 ? ` ${theme.fg("accent", `· ${totalBgCount} bg`)}` : "";
 
-	const headerLeft = `${theme.fg("accent", theme.bold("[swarm]"))} ${theme.bold(snapshot.title)} ${theme.fg("dim", `· ${activeChannelCount} ch · #${snapshot.head}`)}`;
+	const headerLeft = `${theme.fg("accent", theme.bold("[swarm]"))} ${theme.bold(snapshot.title)} ${theme.fg("dim", `· ${activeChannelCount} ch · #${snapshot.head}`)}${bgHeaderPart}`;
 	const headerStats = `${theme.fg("muted", `${totalTokens} tok · ${totalCost}`)} ${theme.fg("dim", "· Alt+S / /swarm")}`;
 	const headerLine = truncateToWidth(`${headerLeft} ${headerStats}`, safeWidth);
 
@@ -208,6 +319,10 @@ export function renderSwarmWidgetLines(
 		const nameText = m.state === "killed" ? theme.fg("dim", m.name) : theme.bold(m.name);
 
 		const extras: string[] = [];
+		const bgProcs = getActiveMemberProcesses(snapshot, m);
+		if (bgProcs.length > 0) {
+			extras.push(formatWidgetBgSummary(bgProcs, theme));
+		}
 		if (m.currentActivity) {
 			extras.push(theme.fg("muted", m.currentActivity));
 		}
@@ -1029,7 +1144,7 @@ export class SwarmOverlayComponent implements Component {
 					for (const workerName of thread.tasks) {
 						const member = memberMap.get(workerName);
 						const taskDesc = snapshot.plan.tasks[workerName] ?? "";
-						content.push(this.formatOverviewWorkerRow(workerName, member, taskDesc));
+						content.push(truncateToWidth(this.formatOverviewWorkerRow(snapshot, workerName, member, taskDesc), innerW));
 					}
 					content.push("");
 				}
@@ -1041,7 +1156,12 @@ export class SwarmOverlayComponent implements Component {
 			if (unthreaded.length > 0) {
 				content.push(` ${th.fg("dim", "Unassigned workers")}`);
 				for (const m of unthreaded) {
-					content.push(this.formatOverviewWorkerRow(m.name, m, snapshot.plan.tasks[m.name] ?? ""));
+					content.push(
+						truncateToWidth(
+							this.formatOverviewWorkerRow(snapshot, m.name, m, snapshot.plan.tasks[m.name] ?? ""),
+							innerW,
+						),
+					);
 				}
 				content.push("");
 			}
@@ -1060,7 +1180,7 @@ export class SwarmOverlayComponent implements Component {
 				content.push(`   ${th.fg("dim", "(none)")}`);
 			} else {
 				for (const m of snapshot.members) {
-					content.push(this.formatOverviewWorkerRow(m.name, m, ""));
+					content.push(truncateToWidth(this.formatOverviewWorkerRow(snapshot, m.name, m, ""), innerW));
 				}
 			}
 			content.push("");
@@ -1085,6 +1205,7 @@ export class SwarmOverlayComponent implements Component {
 	}
 
 	private formatOverviewWorkerRow(
+		snapshot: SwarmSnapshot,
 		workerName: string,
 		member: MemberStatusSummary | undefined,
 		taskDesc: string,
@@ -1097,9 +1218,11 @@ export class SwarmOverlayComponent implements Component {
 		const glyph = th.fg(color, getStateGlyph(member.state));
 		const stateStr = th.fg(color, member.state);
 		const desc = taskDesc ? ` ${th.fg("muted", `- ${taskDesc}`)}` : "";
+		const bgProcs = getActiveMemberProcesses(snapshot, member);
+		const bgBadge = bgProcs.length > 0 ? ` ${formatOverlayBgBadge(bgProcs, th)}` : "";
 		const activity = member.currentActivity ? ` ${th.fg("dim", `(${member.currentActivity})`)}` : "";
 		const err = member.lastError ? ` ${th.fg("error", `[err]`)}` : "";
-		return `   ${glyph} ${th.bold(workerName)} [${stateStr}]${desc}${activity}${err}`;
+		return `   ${glyph} ${th.bold(workerName)} [${stateStr}]${desc}${bgBadge}${activity}${err}`;
 	}
 
 	private renderBoardBody(snapshot: SwarmSnapshot, innerW: number, bodyHeight: number): string[] {
@@ -1171,14 +1294,17 @@ export class SwarmOverlayComponent implements Component {
 			const glyph = th.fg(color, getStateGlyph(m.state));
 			const name = isSel ? th.fg("accent", th.bold(m.name)) : th.bold(m.name);
 			const tok = formatTokenCount(m.usage.input + m.usage.output);
-			const line = `${pointer} ${glyph} ${name} ${th.fg(color, m.state)} ${th.fg("dim", `${tok} ${formatCost(m.usage.cost)}`)}${m.lastError ? ` ${th.fg("error", "[err]")}` : ""}`;
+			const bgProcs = getActiveMemberProcesses(snapshot, m);
+			const bgBadge = bgProcs.length > 0 ? ` ${th.fg("accent", `[${bgProcs.length} bg]`)}` : "";
+			const errBadge = m.lastError ? ` ${th.fg("error", "[err]")}` : "";
+			const line = `${pointer} ${glyph} ${name} ${th.fg(color, m.state)}${bgBadge}${errBadge} ${th.fg("dim", `${tok} ${formatCost(m.usage.cost)}`)}`;
 			workerListLines.push(line);
 		}
 
 		if (innerW >= 90) {
 			const leftW = 34;
 			const rightW = innerW - leftW - 1;
-			const detailLines = this.buildWorkerDetailLines(selected, rightW, bodyHeight);
+			const detailLines = this.buildWorkerDetailLines(snapshot, selected, rightW, bodyHeight);
 			const out: string[] = [];
 			for (let i = 0; i < bodyHeight; i++) {
 				const left = padRightVisible(workerListLines[i] ?? "", leftW);
@@ -1196,7 +1322,7 @@ export class SwarmOverlayComponent implements Component {
 			out.push(truncateToWidth(workerListLines[i] ?? "", innerW));
 		}
 		out.push(th.fg("borderMuted", ` ${"─".repeat(Math.max(1, innerW - 2))}`));
-		const detailLimited = this.buildWorkerDetailLines(selected, innerW, remHeight);
+		const detailLimited = this.buildWorkerDetailLines(snapshot, selected, innerW, remHeight);
 		for (let i = 0; i < remHeight; i++) {
 			out.push(truncateToWidth(detailLimited[i] ?? "", innerW));
 		}
@@ -1204,6 +1330,7 @@ export class SwarmOverlayComponent implements Component {
 	}
 
 	private buildWorkerDetailLines(
+		snapshot: SwarmSnapshot,
 		member: MemberStatusSummary,
 		paneWidth: number,
 		maxRows?: number,
@@ -1223,6 +1350,10 @@ export class SwarmOverlayComponent implements Component {
 		}
 		if (member.lastError) {
 			header.push(` ${th.fg("error", "Error:")} ${member.lastError}`);
+		}
+		const bgProcs = getActiveMemberProcesses(snapshot, member);
+		if (bgProcs.length > 0) {
+			header.push(...formatBackgroundProcessDetailLines(bgProcs, safePaneW, th));
 		}
 		header.push(th.fg("borderMuted", ` ${"─".repeat(Math.max(1, safePaneW - 2))}`));
 

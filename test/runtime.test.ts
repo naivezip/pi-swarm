@@ -10,6 +10,8 @@ import {
 	fauxToolCall,
 	type Model,
 	registerFauxProvider,
+	type Tool,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
 	type AgentSessionEvent,
@@ -293,6 +295,26 @@ async function flushMicrotasks(ticks = 5): Promise<void> {
 	for (let i = 0; i < ticks; i++) {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
+}
+
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 4000, intervalMs = 20): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, intervalMs));
+	}
+	throw new Error(`Condition not met within ${timeoutMs}ms`);
 }
 
 afterEach(() => {
@@ -960,5 +982,531 @@ describe("SwarmManager runtime mechanics", () => {
 		expect(existsSync(helper.workers[0].workspacePath)).toBe(false);
 		const worktreeList = execFileSync("git", ["worktree", "list"], { cwd: repoDir, encoding: "utf-8" });
 		expect(worktreeList).not.toContain("helper");
+	});
+
+	it("wakes waiting worker on process_exit and flushes queued process_exit on onWorkerSettled when working", async () => {
+		const cwd = makeTempDir("pi-swarm-proc-wake-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-proc-wake-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		const sessions = new Map<string, MockWorkerSession>();
+		let turnCount = 0;
+		let releaseWorkingTurn: (() => void) | undefined;
+
+		const manager = new SwarmManager({
+			sessionId: "sess-proc-wake",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				const session = new MockWorkerSession(ctx, async (_p, s) => {
+					turnCount += 1;
+					if (turnCount === 2) {
+						await new Promise<void>((resolve) => {
+							releaseWorkingTurn = resolve;
+						});
+					}
+					s.emitAssistantSuccess(`turn-${turnCount}`);
+				});
+				sessions.set(ctx.member.name, session);
+				return session;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "verifier", brief: "Run checks" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		// 1. Worker is waiting -> slow command promotes and emits process_exit -> wakes verifier immediately
+		const bg1 = await manager.runWorkerBash("verifier", {
+			command: `node -e "setTimeout(() => { console.log('bg1-done'); process.exit(0); }, 250)"`,
+			wait_ms: 60,
+			notify_after_seconds: 10,
+		});
+		expect(bg1.status).toBe("running");
+
+		// Snapshot & detailed status reflect active background process
+		const snapDuring = manager.getSnapshot();
+		expect(snapDuring.backgroundProcesses).toHaveLength(1);
+		expect(snapDuring.backgroundProcesses[0].taskId).toBe(bg1.taskId);
+		expect(snapDuring.members[0].backgroundProcesses).toHaveLength(1);
+
+		await waitForCondition(() => (sessions.get("verifier")?.prompts.length ?? 0) >= 2);
+		const wakePrompt1 = sessions.get("verifier")!.prompts[1];
+		expect(wakePrompt1).toContain("[process exit]");
+		expect(wakePrompt1).toContain(bg1.taskId);
+		expect(wakePrompt1).toContain("exited with code 0");
+		expect(wakePrompt1).toContain("bg1-done");
+		expect(manager.getSnapshot().backgroundProcesses).toHaveLength(0);
+
+		// 2. Worker is working during process exit -> queued and flushed right after onWorkerSettled
+		const bg2 = await manager.runWorkerBash("verifier", {
+			command: `node -e "setTimeout(() => { console.log('bg2-queued'); process.exit(2); }, 180)"`,
+			wait_ms: 50,
+			notify_after_seconds: 10,
+		});
+		expect(bg2.status).toBe("running");
+
+		// Put verifier into working state (turn 2 holds until released)
+		manager.postMessage("coordinator", "@verifier start another check");
+		await waitForCondition(() => releaseWorkingTurn !== undefined);
+		expect(manager.getBoard().getMember("verifier")?.state).toBe("working");
+
+		// Wait until bg2 exits while verifier is still working
+		await waitForCondition(() => manager.getSnapshot().backgroundProcesses.length === 0);
+		expect(sessions.get("verifier")!.prompts).toHaveLength(2);
+
+		// Settle turn 2 -> queued process_exit flushes automatically as turn 3
+		releaseWorkingTurn!();
+		await waitForCondition(() => (sessions.get("verifier")?.prompts.length ?? 0) >= 3);
+		const wakePrompt2 = sessions.get("verifier")!.prompts[2];
+		expect(wakePrompt2).toContain("[process exit]");
+		expect(wakePrompt2).toContain(bg2.taskId);
+		expect(wakePrompt2).toContain("exited with code 2");
+		expect(wakePrompt2).toContain("bg2-queued");
+	});
+
+	it("fires process_still_running for non-daemon, suppresses for is_daemon: true, and suppresses process_exit on manual kill", async () => {
+		const cwd = makeTempDir("pi-swarm-proc-rem-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-proc-rem-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		const sessions = new Map<string, MockWorkerSession>();
+		const manager = new SwarmManager({
+			sessionId: "sess-proc-rem",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				const session = new MockWorkerSession(ctx, (_p, s) => s.emitAssistantSuccess("ok"));
+				sessions.set(ctx.member.name, session);
+				return session;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "runner", brief: "Run jobs" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		// Daemon process with short notify_after_seconds -> must NOT fire process_still_running
+		const daemonRes = await manager.runWorkerBash("runner", {
+			command: `node -e "setInterval(() => {}, 1000)"`,
+			wait_ms: 50,
+			is_daemon: true,
+			notify_after_seconds: 0.1,
+		});
+		expect(daemonRes.status).toBe("running");
+
+		await new Promise((r) => setTimeout(r, 260));
+		expect(sessions.get("runner")!.prompts).toHaveLength(1);
+
+		// Non-daemon process -> fires process_still_running reminder
+		const slowRes = await manager.runWorkerBash("runner", {
+			command: `node -e "console.log('still-going'); setInterval(() => {}, 1000)"`,
+			wait_ms: 50,
+			is_daemon: false,
+			notify_after_seconds: 0.15,
+		});
+		expect(slowRes.status).toBe("running");
+
+		await waitForCondition(() => (sessions.get("runner")?.prompts.length ?? 0) >= 2);
+		const reminderPrompt = sessions.get("runner")!.prompts[1];
+		expect(reminderPrompt).toContain("[process still running]");
+		expect(reminderPrompt).toContain(slowRes.taskId);
+		expect(reminderPrompt).toContain("silent for");
+		expect(reminderPrompt).toContain("still-going");
+		expect(reminderPrompt).toContain("manage_process");
+
+		// Manual kill suppresses process_exit wake
+		await manager.manageWorkerProcess("runner", { action: "kill", task_id: slowRes.taskId });
+		await manager.manageWorkerProcess("runner", { action: "kill", task_id: daemonRes.taskId });
+		await new Promise((r) => setTimeout(r, 150));
+		expect(sessions.get("runner")!.prompts).toHaveLength(2);
+	});
+
+	it("preserves pending process_exit across worker model errors and delivers after switchModel recovery", async () => {
+		const cwd = makeTempDir("pi-swarm-proc-err-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-proc-err-root-");
+		const modelA = makeModel("p", "a");
+		const modelB = makeModel("p", "b");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA, modelB], SessionManager.inMemory(cwd));
+
+		const sessions = new Map<string, MockWorkerSession>();
+		let failNext = true;
+
+		const manager = new SwarmManager({
+			sessionId: "sess-proc-err",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				const session = new MockWorkerSession(ctx, (_p, s) => {
+					if (failNext) {
+						failNext = false;
+						s.emitAssistantError("429 quota exceeded");
+						return;
+					}
+					s.emitAssistantSuccess("recovered ok");
+				});
+				sessions.set(ctx.member.name, session);
+				return session;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "builder", brief: "Build" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+		expect(manager.getBoard().getMember("builder")?.lastError).toContain("429");
+
+		// Process exits while worker has lastError -> preserved (not dropped, not hammering broken model)
+		const bg = await manager.runWorkerBash("builder", {
+			command: `node -e "setTimeout(() => { console.log('built-while-errored'); process.exit(0); }, 150)"`,
+			wait_ms: 40,
+			notify_after_seconds: 10,
+		});
+		expect(bg.status).toBe("running");
+
+		await waitForCondition(() => manager.getSnapshot().backgroundProcesses.length === 0);
+		await flushMicrotasks();
+		expect(sessions.get("builder")!.prompts).toHaveLength(1);
+
+		// Switch model -> wakes worker to recover, then flushes preserved process_exit wake
+		const switched = await manager.switchModel({ name: "builder", model: "p/b" }, "coordinator", hostCtx);
+		expect(switched.woke).toBe(true);
+		await waitForCondition(() => (sessions.get("builder")?.prompts.length ?? 0) >= 3);
+		expect(sessions.get("builder")!.prompts[1]).toContain("[model switched]");
+		expect(sessions.get("builder")!.prompts[2]).toContain("[process exit]");
+		expect(sessions.get("builder")!.prompts[2]).toContain("built-while-errored");
+	});
+
+	it("cleans up real child process trees on killTarget, stopAll, and dispose", async () => {
+		const cwd = makeTempDir("pi-swarm-proc-clean-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-proc-clean-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		const manager = new SwarmManager({
+			sessionId: "sess-proc-clean",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) =>
+				new MockWorkerSession(ctx, (_p, s) => s.emitAssistantSuccess("ok")),
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "w1", brief: "Work 1" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "w2", brief: "Work 2" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		const p1 = await manager.runWorkerBash("w1", {
+			command: `node -e "setInterval(() => {}, 1000)"`,
+			wait_ms: 40,
+			is_daemon: true,
+		});
+		const p2 = await manager.runWorkerBash("w2", {
+			command: `node -e "setInterval(() => {}, 1000)"`,
+			wait_ms: 40,
+			is_daemon: true,
+		});
+		expect(p1.status).toBe("running");
+		expect(p2.status).toBe("running");
+		if (p1.status !== "running" || p2.status !== "running") throw new Error("unreachable");
+
+		expect(isPidAlive(p1.pid!)).toBe(true);
+		expect(isPidAlive(p2.pid!)).toBe(true);
+
+		// killTarget kills w1's process without killing w2's
+		await manager.killTarget("w1", "coordinator");
+		await waitForCondition(() => !isPidAlive(p1.pid!));
+		expect(isPidAlive(p2.pid!)).toBe(true);
+
+		// stopAll kills remaining active processes
+		await manager.stopAll();
+		await waitForCondition(() => !isPidAlive(p2.pid!));
+		expect(manager.getSnapshot().backgroundProcesses).toHaveLength(0);
+
+		// dispose kills synchronously
+		await manager.addWorkers({ name: "w3", brief: "Work 3" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+		const p3 = await manager.runWorkerBash("w3", {
+			command: `node -e "setInterval(() => {}, 1000)"`,
+			wait_ms: 40,
+			is_daemon: true,
+		});
+		if (p3.status !== "running") throw new Error("unreachable");
+		expect(isPidAlive(p3.pid!)).toBe(true);
+		manager.dispose();
+		await waitForCondition(() => !isPidAlive(p3.pid!));
+	});
+
+	it("E2E createAgentSession exposes async bash + manage_process on workers and excludes them from monitor", async () => {
+		const cwd = makeTempDir("pi-swarm-e2e-proc-cwd-");
+		const agentDir = makeTempDir("pi-swarm-e2e-proc-agent-");
+		const swarmsRoot = makeTempDir("pi-swarm-e2e-proc-root-");
+
+		const faux = registerFauxProvider({
+			models: [{ id: "faux-proc-1", name: "Faux Proc", reasoning: false }],
+		});
+		extraCleanups.push(() => faux.unregister());
+
+		const fauxModel = faux.getModel();
+		let verifierBashParams: Record<string, unknown> | undefined;
+		let verifierToolNames: string[] = [];
+		let monitorToolNames: string[] = [];
+		let verifierSawPromotedBg = false;
+
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+		});
+		await modelRuntime.setRuntimeApiKey(fauxModel.provider, "faux-key");
+		modelRuntime.registerProvider(fauxModel.provider, {
+			baseUrl: fauxModel.baseUrl,
+			api: fauxModel.api,
+			models: [
+				{
+					id: fauxModel.id,
+					name: fauxModel.name,
+					api: fauxModel.api,
+					reasoning: fauxModel.reasoning,
+					input: fauxModel.input,
+					cost: fauxModel.cost,
+					contextWindow: fauxModel.contextWindow,
+					maxTokens: fauxModel.maxTokens,
+					baseUrl: fauxModel.baseUrl,
+				},
+			],
+		});
+
+		const coordSm = SessionManager.inMemory(cwd);
+		const available = [...modelRuntime.getAvailableSnapshot()];
+		const hostCtx = makeFakeExtensionContext(cwd, fauxModel as Model<Api>, available as Model<Api>[], coordSm);
+
+		const wakes: CoordinatorWakeEvent[] = [];
+		const manager = new SwarmManager({
+			sessionId: "sess-e2e-proc",
+			cwd,
+			agentDir,
+			swarmsRoot,
+			modelRuntime,
+			callbacks: {
+				wakeCoordinator: (wake) => {
+					wakes.push(wake);
+				},
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		const extractToolsFromContext = (ctx: TranscriptContext): Tool[] => {
+			const tools = new Map<string, Tool>();
+			for (const msg of ctx.messages) {
+				if (msg.role === "system") {
+					for (const removed of msg.toolsRemoved ?? []) {
+						tools.delete(removed.name);
+					}
+					for (const added of msg.toolsAdded ?? []) {
+						tools.set(added.name, added);
+					}
+				}
+			}
+			return [...tools.values()];
+		};
+
+		// Verifier turn 1: inspect tools, invoke slow bash (wait_ms: 80 -> promotes to background)
+		// Verifier turn 2: end turn after seeing promoted taskId so async process_exit wakes it
+		// Verifier turn 3 (woken by process_exit): post [done] to coordinator
+		let step = 0;
+		let capturedLastMsgBeforeExit = "";
+		let capturedWakePrompt = "";
+		faux.setResponses([
+			(ctx) => {
+				step += 1;
+				const currentTools = extractToolsFromContext(ctx);
+				verifierToolNames = currentTools.map((t) => t.name);
+				verifierBashParams = currentTools.find((t) => t.name === "bash")?.parameters as
+					| Record<string, unknown>
+					| undefined;
+				return fauxAssistantMessage([
+					fauxToolCall("bash", {
+						command: `node -e "setTimeout(() => { console.log('e2e-bg-complete'); process.exit(0); }, 600)"`,
+						wait_ms: 80,
+						notify_after_seconds: 10,
+					}),
+				]);
+			},
+			(ctx) => {
+				step += 1;
+				const lastMsg = ctx.messages[ctx.messages.length - 1];
+				capturedLastMsgBeforeExit = JSON.stringify(lastMsg);
+				verifierSawPromotedBg = capturedLastMsgBeforeExit.includes("promoted to background");
+				return fauxAssistantMessage("Ending turn to await async process_exit wake.");
+			},
+			(ctx) => {
+				step += 1;
+				capturedWakePrompt = JSON.stringify(ctx.messages[ctx.messages.length - 1]);
+				return fauxAssistantMessage([
+					fauxToolCall("post_message", { text: "@coordinator [done] e2e async bash verified" }),
+				]);
+			},
+			() => fauxAssistantMessage("Reported done."),
+		]);
+
+		await manager.addWorkers({ name: "verifier", brief: "Run slow check" }, "coordinator", hostCtx);
+		manager.onCoordinatorSettled();
+		await waitForCondition(() => {
+			const m = manager.getBoard().getMember("verifier");
+			if (m?.lastError) {
+				throw new Error(`verifier failed: ${m.lastError}`);
+			}
+			return wakes.length >= 1 && m?.state === "waiting";
+		}, 8000);
+
+		expect(step).toBeGreaterThanOrEqual(3);
+		expect(verifierSawPromotedBg).toBe(true);
+		expect(capturedWakePrompt).toContain("[process exit]");
+		expect(capturedWakePrompt).toContain("e2e-bg-complete");
+		expect(verifierToolNames).toContain("bash");
+		expect(verifierToolNames).toContain("manage_process");
+		const props = (verifierBashParams as { properties?: Record<string, unknown> } | undefined)?.properties;
+		expect(props).toHaveProperty("wait_ms");
+		expect(props).toHaveProperty("is_daemon");
+		expect(props).toHaveProperty("notify_after_seconds");
+		expect(wakes[0].text).toContain("[done] e2e async bash verified");
+
+		const verifierJsonl = readFileSync(manager.getBoard().getMember("verifier")!.sessionFile, "utf-8");
+		expect(verifierJsonl).toContain("NEVER poll `manage_process` in a loop");
+
+		// Now spawn a real monitor and verify strict read-only + scheduler boundary
+		faux.setResponses([
+			(ctx) => {
+				monitorToolNames = extractToolsFromContext(ctx).map((t) => t.name);
+				return fauxAssistantMessage("Monitor ready.");
+			},
+		]);
+		await manager.addWorkers({ name: "monitor", brief: "Watch swarm" }, "coordinator", hostCtx);
+		await waitForCondition(() => monitorToolNames.length > 0 && manager.getBoard().getMember("monitor")?.state === "waiting", 6000);
+
+		expect(monitorToolNames).not.toContain("bash");
+		expect(monitorToolNames).not.toContain("manage_process");
+		expect(monitorToolNames).not.toContain("edit");
+		expect(monitorToolNames).not.toContain("write");
+		expect(monitorToolNames).toContain("read");
+		expect(monitorToolNames).toContain("schedule");
+		expect(monitorToolNames).toContain("manage_task");
+	});
+
+	it("does not leave orphan processes when killTarget or stopAll races with in-flight runWorkerBash", async () => {
+		const cwd = makeTempDir("pi-swarm-kill-race-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-kill-race-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		const manager = new SwarmManager({
+			sessionId: "sess-kill-race",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) =>
+				new MockWorkerSession(ctx, (_p, s) => s.emitAssistantSuccess("ok")),
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "w1", brief: "Work 1" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		// Race in-flight runWorkerBash against killTarget
+		const bashPromise = manager.runWorkerBash("w1", {
+			command: `node -e "setInterval(() => {}, 1000)"`,
+			wait_ms: 40,
+			is_daemon: true,
+		});
+		const killPromise = manager.killTarget("w1", "coordinator");
+		await expect(bashPromise).rejects.toThrow(/cancelled|killed/i);
+		await killPromise;
+		expect(manager.getSnapshot().backgroundProcesses).toEqual([]);
+		expect(manager.getBoard().getMember("w1")?.state).toBe("killed");
+
+		// Race in-flight runWorkerBash against stopAll
+		await manager.addWorkers({ name: "w2", brief: "Work 2" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+		const bashPromise2 = manager.runWorkerBash("w2", {
+			command: `node -e "setInterval(() => {}, 1000)"`,
+			wait_ms: 40,
+			is_daemon: true,
+		});
+		const stopPromise = manager.stopAll();
+		await expect(bashPromise2).rejects.toThrow(/cancelled|stopping/i);
+		await stopPromise;
+		expect(manager.getSnapshot().backgroundProcesses).toEqual([]);
+	});
+
+	it("does not launch prompt or resurrect worker if killTarget runs while wakeWorker awaits sessionFactory", async () => {
+		const cwd = makeTempDir("pi-swarm-wake-kill-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-wake-kill-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		let allowSecondSession!: () => void;
+		let callCount = 0;
+		const createdSessions: MockWorkerSession[] = [];
+
+		const manager = new SwarmManager({
+			sessionId: "sess-wake-kill-race",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				callCount += 1;
+				if (callCount === 2) {
+					await new Promise<void>((resolve) => {
+						allowSecondSession = resolve;
+					});
+				}
+				const s = new MockWorkerSession(ctx, (_p, sess) => sess.emitAssistantSuccess("ok"));
+				createdSessions.push(s);
+				return s;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "w1", brief: "Initial" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		// Simulate restart where w1 is stopped (no activeWorkers entry)
+		manager.dispose();
+		const resumed = SwarmManager.loadIfExists({
+			sessionId: "sess-wake-kill-race",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				callCount += 1;
+				await new Promise<void>((resolve) => {
+					allowSecondSession = resolve;
+				});
+				const s = new MockWorkerSession(ctx, (_p, sess) => sess.emitAssistantSuccess("ok"));
+				createdSessions.push(s);
+				return s;
+			},
+		})!;
+		managersToDispose.push(resumed);
+		resumed.updateHostContext(hostCtx);
+
+		// Wake stopped worker -> enters await sessionFactory
+		resumed.postMessage("coordinator", "@w1 resume work");
+		await waitForCondition(() => allowSecondSession !== undefined);
+
+		// Kill w1 while sessionFactory is still pending
+		await resumed.killTarget("w1", "coordinator");
+		allowSecondSession();
+		await flushMicrotasks();
+
+		expect(resumed.getBoard().getMember("w1")?.state).toBe("killed");
+		const secondSession = createdSessions[1];
+		expect(secondSession.disposed).toBe(true);
+		expect(secondSession.prompts).toEqual([]);
 	});
 });

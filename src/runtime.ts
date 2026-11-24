@@ -27,15 +27,22 @@ import {
 	getSwarmDir,
 	SwarmBoard,
 } from "./board.ts";
+import { BackgroundProcessManager } from "./process-manager.ts";
 import { SwarmScheduler } from "./scheduler.ts";
 import { createSwarmToolDefinitions } from "./tools.ts";
 import {
+	type AsyncBashInput,
+	type AsyncBashResult,
+	type BackgroundProcessEvent,
+	type BackgroundProcessSummary,
 	type BoardMessage,
 	type ChannelRecord,
 	type CoordinatorState,
 	createEmptyUsage,
 	isMonitorName,
 	MAIN_CHANNEL,
+	type ManageProcessInput,
+	type ManageProcessResult,
 	type ManageTaskInput,
 	type ManageTaskResult,
 	type MemberRecord,
@@ -57,6 +64,7 @@ import { removeWorkspace, setupWorkspace } from "./workspace.ts";
 
 export const SWARM_TOOL_NAMES: readonly string[] = ["swarm", "post_message", "read_board", "swarm_wait"];
 export const MONITOR_TOOL_NAMES: readonly string[] = ["schedule", "manage_task"];
+export const WORKER_PROCESS_TOOL_NAMES: readonly string[] = ["bash", "manage_process"];
 
 export interface CoordinatorWakeEvent {
 	seq: number;
@@ -68,7 +76,7 @@ export interface CoordinatorWakeEvent {
 }
 
 export interface HostCallbacks {
-	wakeCoordinator: (wake: CoordinatorWakeEvent) => void | Promise<void>;
+	wakeCoordinator: (wake: CoordinatorWakeEvent) => boolean | void | Promise<boolean | void>;
 	setCoordinatorModel?: (model: Model<Api>) => Promise<boolean>;
 	onToolsActivationNeeded?: () => void;
 }
@@ -103,6 +111,7 @@ export interface SwarmSnapshot {
 	messages: BoardMessage[];
 	totals: SwarmTotals;
 	scheduledTasks: ScheduledTaskRecord[];
+	backgroundProcesses: BackgroundProcessSummary[];
 }
 
 export interface AddWorkerInput {
@@ -231,7 +240,9 @@ export interface SwarmManagerOptions {
 type WakeReason =
 	| { kind: "board"; message: BoardMessage }
 	| { kind: "schedule"; task: ScheduledTaskRecord }
-	| { kind: "model_switch"; modelRef: string };
+	| { kind: "model_switch"; modelRef: string }
+	| { kind: "process_exit"; event: BackgroundProcessEvent; extraEvents?: BackgroundProcessEvent[] }
+	| { kind: "process_still_running"; event: BackgroundProcessEvent; extraEvents?: BackgroundProcessEvent[] };
 
 interface ActiveWorkerRuntime {
 	session: WorkerSessionHandle;
@@ -411,6 +422,19 @@ function writeForkedSessionFile(
 	writeFileSync(targetSessionFile, `${lines.join("\n")}\n`, "utf-8");
 }
 
+function formatDurationShort(ms: number): string {
+	if (ms < 1000) {
+		return `${Math.max(0, Math.round(ms))}ms`;
+	}
+	const secs = ms / 1000;
+	if (secs < 60) {
+		return `${secs.toFixed(1)}s`;
+	}
+	const mins = Math.floor(secs / 60);
+	const remSecs = Math.round(secs % 60);
+	return `${mins}m${remSecs}s`;
+}
+
 function buildWorkerSystemPromptSection(member: MemberRecord): string {
 	const channelList = member.channels.length > 0 ? member.channels.map((c) => `#${c}`).join(", ") : "#main";
 	if (isMonitorName(member.name)) {
@@ -419,6 +443,7 @@ function buildWorkerSystemPromptSection(member: MemberRecord): string {
 			`Channels: all (#main + every area channel). Workspace: ${member.workspacePath} (${member.workspaceMode}).`,
 			"Rules:",
 			"- Never do coding, file edits, builds, or user replies. Load and follow the `swarm-monitor` skill.",
+			"- You remain strictly read-only: you have no `bash` or `manage_process` tools.",
 			"- Post only to break a stall, citing #seq numbers and timestamps, addressed to one member by name.",
 			"- You have exclusive access to `schedule` and `manage_task`.",
 			"- `swarm_wait` is a non-blocking park: call `swarm_wait` and end your turn immediately; Pi wakes you asynchronously on cron ticks or matching posts.",
@@ -436,6 +461,11 @@ function buildWorkerSystemPromptSection(member: MemberRecord): string {
 		"- Start your final completion post with `[done]` after the `@mention` (e.g. `@coordinator [done] <summary>`).",
 		"- `swarm_wait` is a non-blocking park: call `swarm_wait({ since: <lastReadSeq>, mentions_only?: boolean })` and end your turn immediately; you will be woken asynchronously when a matching post arrives.",
 		"- You may call `swarm{action:\"add\"}` to spawn helpers for your own work (you may `kill` only helpers you added, and `model` yourself or helpers you added).",
+		"Shell and background process rules:",
+		"- `bash` runs commands with sync-to-async promotion (`wait_ms`, default 10000ms, max 30000ms). Commands exiting within `wait_ms` return synchronously; longer commands promote to the background without being killed and return a `taskId` and output tail so far.",
+		"- NEVER poll `manage_process` in a loop after a command promotes to the background. End your turn (or do other independent work) and wait for the async `process_exit` or `process_still_running` wake.",
+		"- For long-lived dev servers, watchers, or port listeners, pass `is_daemon: true` to `bash` so reminder wakes are suppressed, and always terminate them with `manage_process({ action: \"kill\", task_id })` once finished.",
+		"- Use `manage_process` (`list`, `status`, `send_input`, `kill`) to inspect, send stdin to, or terminate your own background processes.",
 	].join("\n");
 }
 
@@ -454,6 +484,7 @@ async function defaultWorkerSessionFactory(context: CreateWorkerSessionContext):
 	});
 	await resourceLoader.reload();
 
+	const isMonitor = isMonitorName(member.name);
 	const sessionManager = SessionManager.open(member.sessionFile, workersDir, member.workspacePath);
 	const { session } = await createAgentSession({
 		cwd: member.workspacePath,
@@ -461,7 +492,8 @@ async function defaultWorkerSessionFactory(context: CreateWorkerSessionContext):
 		model,
 		modelRuntime,
 		scopedModels,
-		tools: ["+grep", "+find", "+ls"],
+		tools: isMonitor ? ["-bash", "-powershell", "-edit", "-write", "+grep", "+find", "+ls"] : ["+grep", "+find", "+ls"],
+		...(isMonitor ? { excludeTools: ["bash", "powershell", "edit", "write", "manage_process"] } : {}),
 		resourceLoader,
 		sessionManager,
 		settingsManager,
@@ -469,9 +501,9 @@ async function defaultWorkerSessionFactory(context: CreateWorkerSessionContext):
 
 	await session.bindExtensions({});
 
-	const requiredTools = isMonitorName(member.name)
+	const requiredTools = isMonitor
 		? [...SWARM_TOOL_NAMES, ...MONITOR_TOOL_NAMES]
-		: [...SWARM_TOOL_NAMES];
+		: [...SWARM_TOOL_NAMES, ...WORKER_PROCESS_TOOL_NAMES];
 	const currentActive = session.getActiveToolNames();
 	const missingTools = requiredTools.filter((name) => !currentActive.includes(name));
 	if (missingTools.length > 0) {
@@ -493,6 +525,7 @@ export class SwarmManager {
 
 	private readonly board: SwarmBoard;
 	private readonly scheduler: SwarmScheduler;
+	private readonly processManager: BackgroundProcessManager;
 	private readonly callbacks: HostCallbacks | undefined;
 	private readonly modelRuntime: ModelRuntime | undefined;
 	private readonly sessionFactory: WorkerSessionFactory;
@@ -501,11 +534,13 @@ export class SwarmManager {
 	private readonly wakingWorkers = new Set<string>();
 	private readonly pendingWorkerWakeSeq = new Map<string, number>();
 	private readonly pendingWorkerScheduleWake = new Map<string, ScheduledTaskRecord>();
+	private readonly pendingWorkerProcessEvents = new Map<string, BackgroundProcessEvent[]>();
 	private readonly listeners = new Set<(snapshot: SwarmSnapshot) => void>();
 
 	private hostContext: ExtensionContext | undefined;
 	private coordinatorExplicitWaitThisTurn = false;
 	private pendingCoordinatorWake: CoordinatorWakeEvent | undefined;
+	private stopping = false;
 	private disposed = false;
 
 	constructor(options: SwarmManagerOptions, existingBoard?: SwarmBoard) {
@@ -532,6 +567,12 @@ export class SwarmManager {
 				this.board.getMember(workerName)?.state === "working" || this.wakingWorkers.has(workerName),
 			onTrigger: (task) => {
 				this.handleScheduledTick(task);
+			},
+		});
+
+		this.processManager = new BackgroundProcessManager({
+			onEvent: (event) => {
+				this.handleBackgroundProcessEvent(event);
 			},
 		});
 	}
@@ -570,6 +611,9 @@ export class SwarmManager {
 
 	/** Updates the latest host `ExtensionContext` for model registry / scoped models / coordinator session snapshots. */
 	updateHostContext(ctx: ExtensionContext): void {
+		if (this.isWorkerContext(ctx)) {
+			return;
+		}
 		this.hostContext = ctx;
 	}
 
@@ -602,7 +646,8 @@ export class SwarmManager {
 
 	/** Returns a full point-in-time snapshot for UI widgets, overlays, and extensions. */
 	getSnapshot(): SwarmSnapshot {
-		const detailed = this.board.getDetailedStatus();
+		const detailed = this.getDetailedStatus();
+		const activeProcs = this.processManager.getActiveSummaries();
 		const totals: SwarmTotals = {
 			input: 0,
 			output: 0,
@@ -635,12 +680,24 @@ export class SwarmManager {
 			messages,
 			totals,
 			scheduledTasks: this.getScheduledTasks(),
+			backgroundProcesses: activeProcs,
 		};
 	}
 
 	/** Returns the detailed member/channel status snapshot (`read_board{status: true}`). */
 	getDetailedStatus(): SwarmDetailedStatus {
-		return this.board.getDetailedStatus();
+		const detailed = this.board.getDetailedStatus();
+		const activeProcs = this.processManager.getActiveSummaries();
+		const byOwner = new Map<string, BackgroundProcessSummary[]>();
+		for (const proc of activeProcs) {
+			const list = byOwner.get(proc.ownerWorker) ?? [];
+			list.push(proc);
+			byOwner.set(proc.ownerWorker, list);
+		}
+		for (const member of detailed.members) {
+			member.backgroundProcesses = byOwner.get(member.name) ?? [];
+		}
+		return detailed;
 	}
 
 	/** Reads board messages for UI inspection without advancing any read cursor. */
@@ -730,6 +787,18 @@ export class SwarmManager {
 		this.board.saveState();
 		this.emitSnapshot();
 
+		this.flushPendingCoordinatorWake();
+	}
+
+	/** Flushes any queued coordinator wakeup if the coordinator is waiting and idle. */
+	flushPendingCoordinatorWake(): void {
+		if (this.disposed) {
+			return;
+		}
+		const state = this.board.getState();
+		if (state.coordinator.state === "working" || (this.hostContext && !this.hostContext.isIdle())) {
+			return;
+		}
 		const pending = this.pendingCoordinatorWake;
 		this.pendingCoordinatorWake = undefined;
 		if (pending && state.coordinator.lastReadSeq < pending.seq) {
@@ -1010,6 +1079,9 @@ export class SwarmManager {
 
 		const results: AddWorkerEntryResult[] = [];
 		for (const spec of specs) {
+			if (this.disposed || this.stopping) {
+				throw new Error("SwarmManager is stopping or disposed.");
+			}
 			const ws = await setupWorkspace({
 				mode: workspaceMode,
 				hostCwd: baseCwd,
@@ -1017,6 +1089,11 @@ export class SwarmManager {
 				swarmId: state.swarmId,
 				workerName: spec.name,
 			});
+			if (this.disposed || this.stopping) {
+				const fallbackCwd = existsSync(baseCwd) ? baseCwd : this.cwd;
+				await removeWorkspace(ws.mode, ws.workspacePath, fallbackCwd).catch(() => {});
+				throw new Error("SwarmManager is stopping or disposed.");
+			}
 
 			const sessionFile = join(workersDir, `${spec.name}.jsonl`);
 			if (forkSource) {
@@ -1113,6 +1190,7 @@ export class SwarmManager {
 				callerName: memberName,
 				defaultActive: true,
 				includeMonitorTools: includeMonitor,
+				includeWorkerProcessTools: !includeMonitor,
 			});
 			for (const tool of tools.all) {
 				pi.registerTool(tool);
@@ -1140,6 +1218,15 @@ export class SwarmManager {
 			modelRuntime: this.modelRuntime,
 			workerExtension: this.createWorkerExtension(member.name),
 		});
+
+		if (this.disposed || this.stopping || member.state === "killed") {
+			try {
+				session.dispose();
+			} catch {
+				// Ignore dispose errors on cancelled startup.
+			}
+			throw new Error(`Worker "${member.name}" was killed or stopped during session startup.`);
+		}
 
 		if (session.model && !member.model) {
 			member.model = formatModelRef(session.model);
@@ -1234,6 +1321,12 @@ export class SwarmManager {
 		}
 	}
 
+	private enqueuePendingProcessEvent(memberName: string, event: BackgroundProcessEvent): void {
+		const queue = this.pendingWorkerProcessEvents.get(memberName) ?? [];
+		queue.push(event);
+		this.pendingWorkerProcessEvents.set(memberName, queue);
+	}
+
 	private onWorkerSettled(member: MemberRecord, runtime: ActiveWorkerRuntime, _aborted: boolean): void {
 		if (this.disposed || member.state === "killed") {
 			return;
@@ -1252,16 +1345,28 @@ export class SwarmManager {
 		this.board.saveState();
 		this.emitSnapshot();
 
-		const pendingSeq = this.pendingWorkerWakeSeq.get(member.name);
-		this.pendingWorkerWakeSeq.delete(member.name);
-
-		const pendingSchedule = this.pendingWorkerScheduleWake.get(member.name);
-		this.pendingWorkerScheduleWake.delete(member.name);
-
 		if (runtime.lastTurnErrored) {
-			// Failed turns sit out until a new board post, model switch, or next scheduled tick.
+			// Failed turns sit out until a new board post, model switch, or next scheduled tick,
+			// preserving any queued board/schedule/process wakes for recovery.
 			return;
 		}
+
+		const pendingProcEvents = this.pendingWorkerProcessEvents.get(member.name);
+		if (pendingProcEvents && pendingProcEvents.length > 0) {
+			this.pendingWorkerProcessEvents.delete(member.name);
+			const [firstEvent, ...extraEvents] = pendingProcEvents;
+			queueMicrotask(() => {
+				void this.wakeWorker(member.name, {
+					kind: firstEvent.kind,
+					event: firstEvent,
+					...(extraEvents.length > 0 ? { extraEvents } : {}),
+				});
+			});
+			return;
+		}
+
+		const pendingSeq = this.pendingWorkerWakeSeq.get(member.name);
+		this.pendingWorkerWakeSeq.delete(member.name);
 
 		if (pendingSeq !== undefined && member.lastReadSeq < pendingSeq) {
 			const msg = this.board.getMessagesBySeqs([pendingSeq], member.name)[0];
@@ -1273,7 +1378,9 @@ export class SwarmManager {
 			}
 		}
 
+		const pendingSchedule = this.pendingWorkerScheduleWake.get(member.name);
 		if (pendingSchedule) {
+			this.pendingWorkerScheduleWake.delete(member.name);
 			queueMicrotask(() => {
 				void this.wakeWorker(member.name, { kind: "schedule", task: pendingSchedule });
 			});
@@ -1454,11 +1561,17 @@ export class SwarmManager {
 				unreadCount,
 				head: this.board.head,
 			};
-			if (state.coordinator.state === "working") {
-				this.pendingCoordinatorWake = wake;
+			if (state.coordinator.state === "working" || (this.hostContext && !this.hostContext.isIdle())) {
+				this.queueCoordinatorWake(wake);
 			} else if (state.coordinator.lastReadSeq < msg.seq) {
 				this.dispatchCoordinatorWake(wake);
 			}
+		}
+	}
+
+	private queueCoordinatorWake(wake: CoordinatorWakeEvent): void {
+		if (!this.pendingCoordinatorWake || wake.seq >= this.pendingCoordinatorWake.seq) {
+			this.pendingCoordinatorWake = wake;
 		}
 	}
 
@@ -1470,9 +1583,42 @@ export class SwarmManager {
 		if (state.coordinator.lastReadSeq >= wake.seq) {
 			return;
 		}
-		void Promise.resolve(this.callbacks?.wakeCoordinator(wake)).catch(() => {
-			// Host wake callback failures must not crash board posting.
-		});
+		if (this.hostContext && !this.hostContext.isIdle()) {
+			this.queueCoordinatorWake(wake);
+			return;
+		}
+		void Promise.resolve(this.callbacks?.wakeCoordinator(wake))
+			.then((delivered) => {
+				if (delivered === false && !this.disposed) {
+					this.queueCoordinatorWake(wake);
+				}
+			})
+			.catch(() => {
+				// Host wake callback failures must not crash board posting.
+			});
+	}
+
+	private handleBackgroundProcessEvent(event: BackgroundProcessEvent): void {
+		if (this.disposed || this.stopping) {
+			return;
+		}
+		const ownerName = event.summary.ownerWorker;
+		const member = this.board.getMember(ownerName);
+		if (!member || member.state === "killed") {
+			return;
+		}
+
+		this.emitSnapshot();
+
+		const runtime = this.activeWorkers.get(ownerName);
+		const isBusy = member.state === "working" || this.wakingWorkers.has(ownerName);
+		const hasPendingError = Boolean(member.lastError) || Boolean(runtime?.lastTurnErrored);
+		if (isBusy || hasPendingError) {
+			this.enqueuePendingProcessEvent(ownerName, event);
+			return;
+		}
+
+		void this.wakeWorker(ownerName, { kind: event.kind, event });
 	}
 
 	private handleScheduledTick(task: ScheduledTaskRecord): void {
@@ -1490,8 +1636,30 @@ export class SwarmManager {
 		void this.wakeWorker(member.name, { kind: "schedule", task });
 	}
 
+	private queueReasonWhileBusy(memberName: string, reason: WakeReason): void {
+		if (reason.kind === "board") {
+			const prev = this.pendingWorkerWakeSeq.get(memberName) ?? 0;
+			if (reason.message.seq > prev) {
+				this.pendingWorkerWakeSeq.set(memberName, reason.message.seq);
+			}
+		} else if (reason.kind === "schedule") {
+			this.pendingWorkerScheduleWake.set(memberName, reason.task);
+		} else if (reason.kind === "process_exit" || reason.kind === "process_still_running") {
+			this.enqueuePendingProcessEvent(memberName, reason.event);
+			if (reason.extraEvents) {
+				for (const extra of reason.extraEvents) {
+					this.enqueuePendingProcessEvent(memberName, extra);
+				}
+			}
+		}
+	}
+
 	private async wakeWorker(memberName: string, reason: WakeReason): Promise<void> {
-		if (this.disposed || this.wakingWorkers.has(memberName)) {
+		if (this.disposed || this.stopping) {
+			return;
+		}
+		if (this.wakingWorkers.has(memberName)) {
+			this.queueReasonWhileBusy(memberName, reason);
 			return;
 		}
 		const member = this.board.getMember(memberName);
@@ -1499,14 +1667,7 @@ export class SwarmManager {
 			return;
 		}
 		if (member.state === "working") {
-			if (reason.kind === "board") {
-				const prev = this.pendingWorkerWakeSeq.get(memberName) ?? 0;
-				if (reason.message.seq > prev) {
-					this.pendingWorkerWakeSeq.set(memberName, reason.message.seq);
-				}
-			} else if (reason.kind === "schedule") {
-				this.pendingWorkerScheduleWake.set(memberName, reason.task);
-			}
+			this.queueReasonWhileBusy(memberName, reason);
 			return;
 		}
 
@@ -1526,11 +1687,17 @@ export class SwarmManager {
 				const model = member.model ? this.resolveModelBestEffort(member.model) : undefined;
 				runtime = await this.createAndStartWorkerSession(member, model);
 			}
+			if (this.disposed || this.stopping || this.board.getMember(memberName)?.state === "killed") {
+				return;
+			}
 			runtime.lastTurnErrored = false;
 
 			const promptText = this.formatWakePrompt(member, reason);
 			this.launchWorkerPrompt(memberName, promptText);
 		} catch (err) {
+			if (this.disposed || this.stopping || this.board.getMember(memberName)?.state === "killed") {
+				return;
+			}
 			member.state = "waiting";
 			member.lastError = err instanceof Error ? err.message : String(err);
 			this.board.saveState();
@@ -1548,12 +1715,39 @@ export class SwarmManager {
 		}
 	}
 
+	private formatProcessEventSection(event: BackgroundProcessEvent): string {
+		const s = event.summary;
+		const tailBlock = event.outputTail.length > 0 ? event.outputTail : "(no output)";
+		const logLine = event.fullOutputPath ? `\nFull output log: ${event.fullOutputPath}` : "";
+		if (event.kind === "process_exit") {
+			const signalNote = s.signal ? ` (signal ${s.signal})` : "";
+			return [
+				`[process exit] Background process ${s.taskId} exited with code ${s.exitCode ?? 1}${signalNote} after ${formatDurationShort(s.elapsedMs)}.`,
+				`Command: ${s.command}${logLine}`,
+				`Output tail${event.truncated ? " (truncated)" : ""}:`,
+				tailBlock,
+				`Action: Process ${s.taskId} has finished. Continue your work, post results on the board with post_message, or call swarm_wait if waiting on others.`,
+			].join("\n");
+		}
+		return [
+			`[process still running] Background process ${s.taskId} is still running (elapsed ${formatDurationShort(s.elapsedMs)}, silent for ${formatDurationShort(s.silentMs)}).`,
+			`Command: ${s.command}${logLine}`,
+			`Latest output tail${event.truncated ? " (truncated)" : ""}:`,
+			tailBlock,
+			`Action: Do NOT poll in a loop. End your turn to keep waiting for process_exit, inspect with manage_process({ action: "status", task_id: "${s.taskId}" }), send input with manage_process({ action: "send_input", task_id: "${s.taskId}", input: "..." }), or kill it with manage_process({ action: "kill", task_id: "${s.taskId}" }).`,
+		].join("\n");
+	}
+
 	private formatWakePrompt(member: MemberRecord, reason: WakeReason): string {
 		if (reason.kind === "schedule") {
 			return `[scheduled:${reason.task.taskId}] ${reason.task.prompt}`;
 		}
 		if (reason.kind === "model_switch") {
 			return `[model switched] Your model was switched to ${reason.modelRef}. Resume your unfinished work.`;
+		}
+		if (reason.kind === "process_exit" || reason.kind === "process_still_running") {
+			const events = [reason.event, ...(reason.extraEvents ?? [])];
+			return events.map((ev) => this.formatProcessEventSection(ev)).join("\n\n---\n\n");
 		}
 		const msg = reason.message;
 		const preview = msg.text.length > 160 ? `${msg.text.slice(0, 157)}...` : msg.text;
@@ -1645,8 +1839,10 @@ export class SwarmManager {
 			const hasMatchingUnread = this.board
 				.peekUnread(target, member.lastReadSeq)
 				.some((m) => doesMessageWakeMember(m, member, this.board.getState().members, this.board.getState().channels));
+			const hasPendingProcessEvents = (this.pendingWorkerProcessEvents.get(target)?.length ?? 0) > 0;
+			const hasPendingSchedule = this.pendingWorkerScheduleWake.has(target);
 
-			if (hadError || hasUnfinished || hasMatchingUnread) {
+			if (hadError || hasUnfinished || hasMatchingUnread || hasPendingProcessEvents || hasPendingSchedule) {
 				woke = true;
 				queueMicrotask(() => {
 					void this.wakeWorker(target, { kind: "model_switch", modelRef: newModelRef });
@@ -1696,11 +1892,21 @@ export class SwarmManager {
 			}
 		}
 
-		const killedNames: string[] = [];
+		const killedAt = Date.now();
 		for (const target of targets) {
+			target.state = "killed";
+			target.killedAt = killedAt;
+			target.currentActivity = undefined;
 			this.scheduler.killTasksForWorker(target.name);
 			this.pendingWorkerWakeSeq.delete(target.name);
 			this.pendingWorkerScheduleWake.delete(target.name);
+			this.pendingWorkerProcessEvents.delete(target.name);
+			this.board.upsertMember(target);
+		}
+
+		const killedNames: string[] = [];
+		for (const target of targets) {
+			await this.processManager.killByOwner(target.name);
 
 			const runtime = this.activeWorkers.get(target.name);
 			if (runtime) {
@@ -1722,10 +1928,6 @@ export class SwarmManager {
 			const hostCwd = adder && existsSync(adder.workspacePath) ? adder.workspacePath : this.cwd;
 			await removeWorkspace(target.workspaceMode, target.workspacePath, hostCwd);
 
-			target.state = "killed";
-			target.killedAt = Date.now();
-			target.currentActivity = undefined;
-			this.board.upsertMember(target);
 			killedNames.push(target.name);
 		}
 
@@ -1875,35 +2077,125 @@ export class SwarmManager {
 		return result;
 	}
 
+	/** Executes an async backgrounding shell command on behalf of a non-monitor worker. */
+	async runWorkerBash(callerName: string, input: AsyncBashInput): Promise<AsyncBashResult> {
+		if (this.disposed || this.stopping) {
+			throw new Error("SwarmManager is stopping or disposed.");
+		}
+		if (callerName === "coordinator" || isMonitorName(callerName)) {
+			throw new Error(`Permission denied: "${callerName}" cannot execute worker background bash.`);
+		}
+		const member = this.board.getMember(callerName);
+		if (!member) {
+			throw new Error(`Unknown swarm worker "${callerName}".`);
+		}
+		if (member.state === "killed") {
+			throw new Error(`Worker "${callerName}" has been killed.`);
+		}
+
+		const result = await this.processManager.runCommand({
+			ownerWorker: callerName,
+			command: input.command,
+			cwd: member.workspacePath,
+			waitMs: input.wait_ms,
+			isDaemon: input.is_daemon,
+			notifyAfterSeconds: input.notify_after_seconds,
+			isCancelled: () => this.disposed || this.stopping || member.state === "killed",
+		});
+		if (result.status === "running") {
+			this.emitSnapshot();
+		}
+		return result;
+	}
+
+	/** Manages background processes owned by a non-monitor worker (`list`, `status`, `send_input`, `kill`). */
+	async manageWorkerProcess(callerName: string, input: ManageProcessInput): Promise<ManageProcessResult> {
+		if (this.disposed) {
+			throw new Error("SwarmManager is disposed.");
+		}
+		if (callerName === "coordinator" || isMonitorName(callerName)) {
+			throw new Error(`Permission denied: "${callerName}" cannot manage worker background processes.`);
+		}
+		const member = this.board.getMember(callerName);
+		if (!member) {
+			throw new Error(`Unknown swarm worker "${callerName}".`);
+		}
+		if (member.state === "killed") {
+			throw new Error(`Worker "${callerName}" has been killed.`);
+		}
+
+		switch (input.action) {
+			case "list":
+				return {
+					kind: "list",
+					processes: this.processManager.list(callerName),
+				};
+			case "status": {
+				if (!input.task_id) {
+					throw new Error('manage_process{action:"status"} requires "task_id".');
+				}
+				return {
+					kind: "status",
+					process: this.processManager.getStatus(callerName, input.task_id),
+				};
+			}
+			case "send_input": {
+				if (!input.task_id) {
+					throw new Error('manage_process{action:"send_input"} requires "task_id".');
+				}
+				if (input.input === undefined) {
+					throw new Error('manage_process{action:"send_input"} requires "input".');
+				}
+				return this.processManager.sendInput(callerName, input.task_id, input.input);
+			}
+			case "kill": {
+				if (!input.task_id) {
+					throw new Error('manage_process{action:"kill"} requires "task_id".');
+				}
+				const result = await this.processManager.kill(callerName, input.task_id);
+				this.emitSnapshot();
+				return result;
+			}
+		}
+	}
+
 	/** Aborts all running workers cleanly without deleting their workspaces or histories. */
 	async stopAll(): Promise<void> {
-		this.pendingWorkerWakeSeq.clear();
-		this.pendingWorkerScheduleWake.clear();
-		this.pendingCoordinatorWake = undefined;
+		this.stopping = true;
+		try {
+			this.pendingWorkerWakeSeq.clear();
+			this.pendingWorkerScheduleWake.clear();
+			this.pendingWorkerProcessEvents.clear();
+			this.pendingCoordinatorWake = undefined;
 
-		const entries = [...this.activeWorkers.entries()];
-		for (const [name, runtime] of entries) {
-			try {
-				await runtime.session.abort();
-			} catch {
-				// Ignore abort errors during stopAll.
+			const entries = [...this.activeWorkers.entries()];
+			for (const [name, runtime] of entries) {
+				try {
+					await runtime.session.abort();
+				} catch {
+					// Ignore abort errors during stopAll.
+				}
+				const member = this.board.getMember(name);
+				if (member && member.state === "working") {
+					member.state = "waiting";
+					member.currentActivity = undefined;
+				}
 			}
-			const member = this.board.getMember(name);
-			if (member && member.state === "working") {
-				member.state = "waiting";
-				member.currentActivity = undefined;
+
+			await this.processManager.killAll();
+
+			for (const member of this.board.listMembers()) {
+				if (member.state === "working") {
+					member.state = "stopped";
+					member.currentActivity = undefined;
+				}
 			}
+
+			this.board.saveState();
+			this.emitSnapshot();
+		} finally {
+			this.stopping = false;
 		}
-
-		for (const member of this.board.listMembers()) {
-			if (member.state === "working") {
-				member.state = "stopped";
-				member.currentActivity = undefined;
-			}
-		}
-
-		this.board.saveState();
-		this.emitSnapshot();
 	}
 
 	/** Aborts workers, stops scheduler timers, and disposes sessions while preserving disk state & workspaces for `/resume`. */
@@ -1913,8 +2205,10 @@ export class SwarmManager {
 		}
 		this.disposed = true;
 		this.scheduler.dispose();
+		this.processManager.dispose();
 		this.pendingWorkerWakeSeq.clear();
 		this.pendingWorkerScheduleWake.clear();
+		this.pendingWorkerProcessEvents.clear();
 		this.pendingCoordinatorWake = undefined;
 
 		for (const [name, runtime] of this.activeWorkers.entries()) {

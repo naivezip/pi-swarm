@@ -559,4 +559,125 @@ describe("pi-swarm extension", () => {
 		const restoredBoard = SwarmBoard.load(getSwarmDir("resume-sess", swarmsRoot));
 		expect(restoredBoard?.getMember("coder")?.state).toBe("stopped");
 	});
+
+	it("leaves coordinator bash untouched and flushes coordinator wakes queued while !isIdle() on agent_end/session_compact", async () => {
+		const swarmsRoot = makeTempDir("pi-swarm-wake-race-");
+		const { harness, sessions } = createHarness({ swarmsRoot });
+
+		// Coordinator extension must NOT register bash or manage_process
+		expect(harness.tools.has("bash")).toBe(false);
+		expect(harness.tools.has("manage_process")).toBe(false);
+
+		const swarmCmd = harness.commands.get("swarm")!;
+		await swarmCmd.handler("Coordinate race test", harness.ctx);
+
+		const swarmTool = harness.tools.get("swarm")!;
+		const toolCtx = harness.ctx as unknown as ExtensionToolContext;
+		await swarmTool.execute(
+			"tc-add",
+			{ action: "add", name: "worker-a", brief: "Work" },
+			undefined,
+			undefined,
+			toolCtx,
+		);
+		await new Promise((r) => setTimeout(r, 20));
+
+		// Simulate coordinator settling first
+		harness.setIdle(true);
+		await harness.emit("agent_settled", { type: "agent_settled", aborted: false });
+
+		const workerSession = sessions.get("worker-a")!;
+		const workerPost = workerSession.registeredWorkerTools.get("post_message")!;
+		const workerToolCtx = { ...harness.ctx, sessionManager: workerSession.sessionManager } as unknown as ExtensionToolContext;
+
+		// Case 1: coordinator is !isIdle() WITHOUT before_agent_start (e.g. during compaction) -> queued, NOT dropped
+		harness.setIdle(false);
+		await workerPost.execute(
+			"wt-compact",
+			{ text: "@coordinator [done] Finished during compaction" },
+			undefined,
+			undefined,
+			workerToolCtx,
+		);
+		expect(harness.sentMessages).toHaveLength(0);
+
+		// Compaction finishes -> idle -> queued wake flushes immediately
+		harness.setIdle(true);
+		await harness.emit("session_compact", { type: "session_compact" });
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(String(harness.sentMessages[0].message.content)).toContain("Finished during compaction");
+
+		// Case 2: queued while !isIdle(), then flushed on agent_end once idle
+		harness.setIdle(false);
+		await workerPost.execute(
+			"wt-end",
+			{ text: "@coordinator [done] Finished before agent_end" },
+			undefined,
+			undefined,
+			workerToolCtx,
+		);
+		expect(harness.sentMessages).toHaveLength(1);
+
+		harness.setIdle(true);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] });
+		expect(harness.sentMessages).toHaveLength(2);
+		expect(String(harness.sentMessages[1].message.content)).toContain("Finished before agent_end");
+	});
+
+	it("does not double-deliver pendingCoordinatorWake when wakeCoordinator sees !isIdle() before settling", async () => {
+		const swarmsRoot = makeTempDir("pi-swarm-no-dup-wake-");
+		const { harness, sessions } = createHarness({ swarmsRoot });
+		const swarmCmd = harness.commands.get("swarm")!;
+		await swarmCmd.handler("No duplicate wake", harness.ctx);
+
+		const swarmTool = harness.tools.get("swarm")!;
+		await swarmTool.execute(
+			"tc-add",
+			{ action: "add", name: "worker-a", brief: "Work" },
+			undefined,
+			undefined,
+			harness.ctx as unknown as ExtensionToolContext,
+		);
+		await new Promise((r) => setTimeout(r, 20));
+
+		// Coordinator settles into waiting while hostContext reports idle
+		harness.setIdle(true);
+		await harness.emit("agent_settled", { type: "agent_settled", aborted: false });
+
+		const workerSession = sessions.get("worker-a")!;
+		const workerPost = workerSession.registeredWorkerTools.get("post_message")!;
+		const workerToolCtx = { ...harness.ctx, sessionManager: workerSession.sessionManager } as unknown as ExtensionToolContext;
+
+		// Simulate coordinator busy (both state=working via before_agent_start AND !isIdle())
+		harness.setIdle(false);
+		await harness.emit("before_agent_start", {
+			type: "before_agent_start",
+			messageType: "user",
+			prompt: "busy turn",
+			systemPrompt: "",
+			systemPromptOptions: { sections: {} },
+		});
+
+		await workerPost.execute(
+			"wt-1",
+			{ text: "@coordinator [done] First" },
+			undefined,
+			undefined,
+			workerToolCtx,
+		);
+		await workerPost.execute(
+			"wt-2",
+			{ text: "@coordinator [done] Second" },
+			undefined,
+			undefined,
+			workerToolCtx,
+		);
+		expect(harness.sentMessages).toHaveLength(0);
+
+		// Settling must deliver exactly ONE coalesced wake (not two)
+		harness.setIdle(true);
+		await harness.emit("agent_settled", { type: "agent_settled", aborted: false });
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(String(harness.sentMessages[0].message.content)).toContain("Second");
+	});
 });

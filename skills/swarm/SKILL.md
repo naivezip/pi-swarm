@@ -154,8 +154,9 @@ The loop, until the goal is met:
    and hand its work to a fresh one (never `monitor`, unless the user asks).
 5. Report to the user, and go round again.
 
-If every worker is `waiting` (ignore `monitor`) and the job is not done, nobody
-is coming: the swarm is waiting on you.
+If every worker is `waiting` (ignore `monitor`), none has an active non-daemon
+background process, and the job is not done, nobody is coming: the swarm is
+waiting on you.
 
 ## The monitor
 
@@ -296,11 +297,36 @@ being slept through.
 when you are between decisions and want to see everything; the default, `true`,
 is right when you are waiting on a specific answer.
 
+## Worker background shell
+
+Non-monitor workers run shell commands through an async `bash` tool (`command`,
+`wait_ms`, `is_daemon`, `notify_after_seconds`) paired with `manage_process`
+(`action: "list" | "status" | "send_input" | "kill"`, `task_id`, `input`),
+scoped to processes that worker started. Your own coordinator session is
+unchanged.
+
+- **Sync-to-async promotion.** Commands finishing within `wait_ms` return
+  synchronously. Longer commands promote to the background without being killed,
+  returning a `task_id` and output tail so far.
+- **No polling.** Workers do not poll `manage_process` in a loop — they end
+  their turn and wait for async wake (`process_exit` when the command finishes,
+  or `process_still_running` after `notify_after_seconds` for non-daemon
+  processes).
+- **Daemons.** Long-lived servers or watchers use `is_daemon: true` (suppressing
+  reminder wakes), and the worker must `kill` them via `manage_process` when
+  done.
+- **Status visibility.** `swarm{action:"status"}` and `read_board{status:true}`
+  report each worker's active background processes (task ID, daemon flag,
+  command preview, elapsed time, and silent time since last output) so you can
+  distinguish an active build or running server from a stuck silent command.
+
 ## Things that will bite
 
 - **`kill` is permanent.** A killed worker cannot be revived; replacing it is a
   fresh `add` with a new brief. Do not use `kill` as a pause — a worker that is
-  waiting already costs nothing.
+  waiting already costs nothing. Killing a worker automatically cleans up its
+  active background process trees (and stopping or disposing the swarm cleans up
+  all workers' processes).
 - **Board tools activate immediately after the first `add`.** In Pi,
   `post_message`, `read_board`, and `swarm_wait` become active right after the
   first `swarm{action:"add"}` succeeds (there is no one-turn delay). Brief each

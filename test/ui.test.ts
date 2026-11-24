@@ -14,10 +14,14 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	type CreateWorkerSessionContext,
 	SwarmManager,
+	type SwarmSnapshot,
 	type WorkerSessionHandle,
 } from "../src/runtime.ts";
+import type { BackgroundProcessSummary } from "../src/types.ts";
 import {
+	formatDurationShort,
 	openSwarmOverlay,
+	renderSwarmPlainSummary,
 	renderSwarmWidgetLines,
 	SwarmOverlayComponent,
 	type SwarmOverlayResult,
@@ -536,5 +540,200 @@ describe("Non-TUI fallback and WidgetController", () => {
 
 		await openSwarmOverlay(tuiMock.ctx, mgr);
 		expect(tuiMock.editorText.value).toBe("#42 ");
+	});
+});
+
+describe("Background processes in widget, overlay, and plain summary", () => {
+	function makeProcess(overrides: Partial<BackgroundProcessSummary>): BackgroundProcessSummary {
+		const now = Date.now();
+		return {
+			taskId: "bg-1",
+			ownerWorker: "verifier",
+			command: "npm test",
+			commandPreview: "npm test",
+			state: "running",
+			isDaemon: false,
+			pid: 12345,
+			startedAt: now - 15_200,
+			lastOutputAt: now - 3_400,
+			elapsedMs: 15_200,
+			silentMs: 3_400,
+			...overrides,
+		};
+	}
+
+	async function setupBackgroundSwarm() {
+		const dir = makeTempDir("pi-swarm-bg-ui-");
+		const mgr = new SwarmManager({
+			sessionId: "s-bg-ui",
+			cwd: dir,
+			swarmDir: dir,
+			title: "BG UI Swarm",
+			sessionFactory: async (ctx) => new MockWorkerSession(ctx),
+		});
+		managersToDispose.push(mgr);
+		const mockCtx = makeMockContext(testTheme);
+		mgr.updateHostContext(mockCtx.ctx);
+		await mgr.addWorkers({ name: "author", brief: "Run dev server" }, "coordinator", mockCtx.ctx);
+		await mgr.addWorkers({ name: "verifier", brief: "Run integration tests" }, "coordinator", mockCtx.ctx);
+		await new Promise((r) => setTimeout(r, 30));
+		return { mgr, ctx: mockCtx.ctx };
+	}
+
+	it("formats durations cleanly and omits background process UI when empty or undefined", async () => {
+		expect(formatDurationShort(450)).toBe("450ms");
+		expect(formatDurationShort(15_200)).toBe("15.2s");
+		expect(formatDurationShort(65_000)).toBe("1m5s");
+		expect(formatDurationShort(3_660_000)).toBe("1h1m");
+
+		const { mgr, ctx } = await setupBackgroundSwarm();
+		const baseSnap = mgr.getSnapshot();
+		const legacySnap = {
+			...baseSnap,
+			backgroundProcesses: undefined,
+			members: baseSnap.members.map((m) => ({ ...m, backgroundProcesses: undefined })),
+		} as unknown as SwarmSnapshot;
+
+		const emptyWidget = renderSwarmWidgetLines(baseSnap, testTheme, 100, true)
+			.map((l) => stripTerminalSequences(l))
+			.join("\n");
+		const undefinedWidget = renderSwarmWidgetLines(legacySnap, testTheme, 100, true)
+			.map((l) => stripTerminalSequences(l))
+			.join("\n");
+
+		expect(emptyWidget).toBe(undefinedWidget);
+		expect(emptyWidget).not.toContain("bg");
+
+		const tui = makeFakeTui(32);
+		const done = vi.fn<(r: SwarmOverlayResult | undefined) => void>();
+		const overlay = new SwarmOverlayComponent(tui, testTheme, testKeybindings, mgr, ctx, done, {
+			initialTab: "workers",
+		});
+		const workersPlain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(workersPlain).not.toContain("Background Processes");
+		overlay.dispose();
+	});
+
+	it("renders active background process counts, daemon tags, command previews, and durations in widget, overlay, and plain summary", async () => {
+		const { mgr, ctx } = await setupBackgroundSwarm();
+		const devProc = makeProcess({
+			taskId: "bg-dev-1",
+			ownerWorker: "author",
+			command: "npm run dev -- --port 3000",
+			commandPreview: "npm run dev -- --port 3000",
+			isDaemon: true,
+			elapsedMs: 75_000,
+			silentMs: 62_000,
+		});
+		const testProc = makeProcess({
+			taskId: "bg-test-2",
+			ownerWorker: "verifier",
+			command: "vitest run test/integration.test.ts --reporter=verbose",
+			commandPreview: "vitest run test/integration.test.ts --reporter=verbose",
+			isDaemon: false,
+			elapsedMs: 18_400,
+			silentMs: 2_100,
+		});
+		const exitedProc = makeProcess({
+			taskId: "bg-old-3",
+			ownerWorker: "verifier",
+			command: "echo done",
+			commandPreview: "echo done",
+			state: "exited",
+			exitCode: 0,
+			elapsedMs: 500,
+			silentMs: 100,
+		});
+
+		const baseSnap = mgr.getSnapshot();
+		const snapWithBg: SwarmSnapshot = {
+			...baseSnap,
+			backgroundProcesses: [devProc, testProc],
+			members: baseSnap.members.map((m) => {
+				if (m.name === "author") {
+					return { ...m, backgroundProcesses: [devProc] };
+				}
+				if (m.name === "verifier") {
+					return { ...m, backgroundProcesses: [testProc, exitedProc] };
+				}
+				return m;
+			}),
+		};
+
+		// 1. Persistent widget lines (counts, daemon indicator, preview, elapsed, width safety)
+		const widgetLines = renderSwarmWidgetLines(snapWithBg, testTheme, 88, true);
+		const widgetPlain = widgetLines.map((l) => stripTerminalSequences(l)).join("\n");
+		expect(widgetPlain).toContain("2 bg");
+		expect(widgetPlain).toContain("1 bg");
+		expect(widgetPlain).toContain("[daemon]");
+		expect(widgetPlain).toContain("npm run dev");
+		expect(widgetPlain).toContain("1m15s");
+		expect(widgetPlain).toContain("vitest run");
+		expect(widgetPlain).toContain("18.4s");
+		expect(widgetPlain).not.toContain("echo done");
+		for (const line of widgetLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(88);
+		}
+
+		// Narrow widget width safety
+		const narrowWidgetLines = renderSwarmWidgetLines(snapWithBg, testTheme, 42, true);
+		for (const line of narrowWidgetLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(42);
+		}
+
+		// 2. Plain summary
+		const plainSummary = renderSwarmPlainSummary(snapWithBg);
+		expect(plainSummary).toContain("bg=1");
+		expect(plainSummary).toContain("bg-dev-1 [daemon]");
+		expect(plainSummary).toContain("elapsed 1m15s, silent 1m2s");
+		expect(plainSummary).toContain("bg-test-2 vitest run");
+
+		// 3. Interactive Overlay (Overview & Workers tabs)
+		vi.spyOn(mgr, "getSnapshot").mockReturnValue(snapWithBg);
+		const tui = makeFakeTui(34);
+		const done = vi.fn<(r: SwarmOverlayResult | undefined) => void>();
+		const overlay = new SwarmOverlayComponent(tui, testTheme, testKeybindings, mgr, ctx, done, {
+			initialTab: "overview",
+		});
+
+		const overviewLines = overlay.render(110);
+		const overviewPlain = overviewLines.map((l) => stripTerminalSequences(l)).join("\n");
+		expect(overviewPlain).toContain("[1 bg: [daemon]");
+		expect(overviewPlain).toContain("[1 bg: vitest run");
+		for (const line of overviewLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(110);
+		}
+
+		// Switch to Workers tab -> author selected first (has daemon process)
+		overlay.handleInput("3");
+		const authorWideLines = overlay.render(110);
+		const authorWidePlain = authorWideLines.map((l) => stripTerminalSequences(l)).join("\n");
+		expect(authorWidePlain).toContain("[1 bg]");
+		expect(authorWidePlain).toContain("Background Processes (1):");
+		expect(authorWidePlain).toContain("bg-dev-1 [daemon]");
+		expect(authorWidePlain).toContain("elapsed 1m15s, silent 1m2s");
+		for (const line of authorWideLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(110);
+		}
+
+		// Move selection down to verifier (non-daemon process)
+		overlay.handleInput("\x1b[B");
+		const verifierWidePlain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(verifierWidePlain).toContain("Background Processes (1):");
+		expect(verifierWidePlain).toContain("bg-test-2");
+		expect(verifierWidePlain).toContain("elapsed 18.4s, silent 2.1s");
+		expect(verifierWidePlain).not.toContain("bg-old-3");
+
+		// Narrow stacked Workers layout keeps width <= 72 and still shows details
+		const stackedLines = overlay.render(72);
+		const stackedPlain = stackedLines.map((l) => stripTerminalSequences(l)).join("\n");
+		expect(stackedPlain).toContain("Background Processes (1):");
+		expect(stackedPlain).toContain("bg-test-2");
+		expect(stackedPlain).toContain("elapsed 18.4s, silent 2.1s");
+		for (const line of stackedLines) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(72);
+		}
+
+		overlay.dispose();
 	});
 });

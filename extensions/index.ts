@@ -72,6 +72,7 @@ export function createSwarmExtension(options: SwarmExtensionOptions = {}): (pi: 
 		let coordinatorMode = false;
 		let manager: SwarmManager | undefined;
 		let latestCtx: ExtensionContext | undefined;
+		let pendingCoordinatorWake: CoordinatorWakeEvent | undefined;
 
 		const widgetController = new SwarmWidgetController({
 			getManager: () => manager,
@@ -97,26 +98,53 @@ export function createSwarmExtension(options: SwarmExtensionOptions = {}): (pi: 
 
 		const getSwarmsRoot = (): string => options.swarmsRoot ?? getDefaultSwarmsRoot();
 
+		const queuePendingCoordinatorWake = (wake: CoordinatorWakeEvent): void => {
+			if (!pendingCoordinatorWake || wake.seq >= pendingCoordinatorWake.seq) {
+				pendingCoordinatorWake = wake;
+			}
+		};
+
+		const deliverCoordinatorWake = (wake: CoordinatorWakeEvent): boolean => {
+			if (!latestCtx || !latestCtx.isIdle()) {
+				queuePendingCoordinatorWake(wake);
+				return false;
+			}
+			if (pendingCoordinatorWake && wake.seq >= pendingCoordinatorWake.seq) {
+				pendingCoordinatorWake = undefined;
+			}
+			if (manager && manager.getBoard().getState().coordinator.lastReadSeq >= wake.seq) {
+				return true;
+			}
+			const preview = wake.text.length > 200 ? `${wake.text.slice(0, 197)}...` : wake.text;
+			const content = [
+				`[swarm wake] #${wake.seq} from ${wake.author} in #${wake.channel} (${wake.unreadCount} unread, head #${wake.head}):`,
+				preview,
+				`Call read_board({ since: ${Math.max(0, wake.seq - 1)} }) to inspect unread messages.`,
+			].join("\n");
+			pi.sendMessage(
+				{
+					customType: "pi-swarm-wake",
+					content,
+					display: true,
+					details: wake,
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			return true;
+		};
+
+		const flushPendingCoordinatorWake = (): void => {
+			if (!pendingCoordinatorWake || !latestCtx || !latestCtx.isIdle()) {
+				return;
+			}
+			const wake = pendingCoordinatorWake;
+			pendingCoordinatorWake = undefined;
+			deliverCoordinatorWake(wake);
+		};
+
 		const buildHostCallbacks = () => ({
-			wakeCoordinator: (wake: CoordinatorWakeEvent) => {
-				if (!latestCtx || !latestCtx.isIdle()) {
-					return;
-				}
-				const preview = wake.text.length > 200 ? `${wake.text.slice(0, 197)}...` : wake.text;
-				const content = [
-					`[swarm wake] #${wake.seq} from ${wake.author} in #${wake.channel} (${wake.unreadCount} unread, head #${wake.head}):`,
-					preview,
-					`Call read_board({ since: ${Math.max(0, wake.seq - 1)} }) to inspect unread messages.`,
-				].join("\n");
-				pi.sendMessage(
-					{
-						customType: "pi-swarm-wake",
-						content,
-						display: true,
-						details: wake,
-					},
-					{ triggerTurn: true, deliverAs: "followUp" },
-				);
+			wakeCoordinator: (wake: CoordinatorWakeEvent): boolean => {
+				return deliverCoordinatorWake(wake);
 			},
 			setCoordinatorModel: async (model: Parameters<ExtensionAPI["setModel"]>[0]) => {
 				return pi.setModel(model);
@@ -316,6 +344,7 @@ export function createSwarmExtension(options: SwarmExtensionOptions = {}): (pi: 
 		// Restore persisted swarm state on session_start
 		pi.on("session_start", (_event, ctx) => {
 			latestCtx = ctx;
+			pendingCoordinatorWake = undefined;
 			const sessionId = ctx.sessionManager.getSessionId();
 			const swarmsRoot = getSwarmsRoot();
 			if (!SwarmManager.hasExistingSwarm(sessionId, swarmsRoot)) {
@@ -371,10 +400,26 @@ export function createSwarmExtension(options: SwarmExtensionOptions = {}): (pi: 
 			manager.updateHostContext(ctx);
 			manager.onCoordinatorSettled();
 			widgetController.refresh(ctx);
+			flushPendingCoordinatorWake();
 		});
+
+		// Flush queued coordinator wakeups if idle is reached after agent_end / turn_end / compaction
+		const handlePotentialIdle = (_event: unknown, ctx: ExtensionContext): void => {
+			latestCtx = ctx;
+			if (manager) {
+				manager.updateHostContext(ctx);
+				manager.flushPendingCoordinatorWake();
+			}
+			flushPendingCoordinatorWake();
+		};
+		pi.on("agent_end", handlePotentialIdle);
+		pi.on("turn_end", handlePotentialIdle);
+		pi.on("session_compact", handlePotentialIdle);
+		pi.on("session_compact_failed", handlePotentialIdle);
 
 		// Cleanly abort running workers and stop scheduler timers while preserving disk state & workspaces
 		pi.on("session_shutdown", async () => {
+			pendingCoordinatorWake = undefined;
 			widgetController.dispose();
 			if (manager) {
 				const current = manager;

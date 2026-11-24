@@ -142,6 +142,89 @@ export type ManageTaskResult =
 	| { kind: "list"; tasks: ScheduledTaskRecord[] }
 	| { kind: "kill"; taskId: string; killed: boolean };
 
+export type BackgroundProcessState = "running" | "exited" | "killed";
+
+export interface BackgroundProcessSummary {
+	taskId: string;
+	ownerWorker: string;
+	command: string;
+	commandPreview: string;
+	state: BackgroundProcessState;
+	isDaemon: boolean;
+	pid?: number;
+	startedAt: number;
+	lastOutputAt: number;
+	endedAt?: number;
+	exitCode?: number;
+	signal?: string;
+	elapsedMs: number;
+	silentMs: number;
+	fullOutputPath?: string;
+}
+
+export interface BackgroundProcessDetail extends BackgroundProcessSummary {
+	outputTail: string;
+	truncated: boolean;
+	totalBytes: number;
+}
+
+export interface BackgroundProcessEvent {
+	kind: "process_exit" | "process_still_running";
+	summary: BackgroundProcessSummary;
+	outputTail: string;
+	truncated: boolean;
+	fullOutputPath?: string;
+}
+
+export interface AsyncBashInput {
+	command: string;
+	wait_ms?: number;
+	is_daemon?: boolean;
+	notify_after_seconds?: number;
+}
+
+export type AsyncBashResult =
+	| {
+			status: "exited";
+			taskId: string;
+			command: string;
+			exitCode: number;
+			signal?: string;
+			outputTail: string;
+			truncated: boolean;
+			totalBytes: number;
+			fullOutputPath?: string;
+			elapsedMs: number;
+	  }
+	| {
+			status: "running";
+			taskId: string;
+			command: string;
+			pid?: number;
+			isDaemon: boolean;
+			outputTail: string;
+			truncated: boolean;
+			totalBytes: number;
+			fullOutputPath?: string;
+			elapsedMs: number;
+			silentMs: number;
+			notifyAfterSeconds?: number;
+	  };
+
+export type ManageProcessAction = "list" | "status" | "send_input" | "kill";
+
+export interface ManageProcessInput {
+	action: ManageProcessAction;
+	task_id?: string;
+	input?: string;
+}
+
+export type ManageProcessResult =
+	| { kind: "list"; processes: BackgroundProcessSummary[] }
+	| { kind: "status"; process: BackgroundProcessDetail }
+	| { kind: "send_input"; taskId: string; bytesWritten: number }
+	| { kind: "kill"; taskId: string; killed: boolean; summary: BackgroundProcessSummary };
+
 export interface ReadBoardOptions {
 	since?: number;
 	limit?: number;
@@ -173,6 +256,7 @@ export interface MemberStatusSummary {
 	currentActivity?: string;
 	lastError?: string;
 	usage: MemberUsage;
+	backgroundProcesses?: BackgroundProcessSummary[];
 }
 
 export interface SwarmDetailedStatus {
