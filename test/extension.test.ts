@@ -23,6 +23,7 @@ import {
 	SWARM_TOOL_NAMES,
 	type WorkerSessionHandle,
 } from "../src/runtime.ts";
+import type { SwarmOverlayOptions, SwarmOverlayResult } from "../src/ui.ts";
 
 const tempDirs: string[] = [];
 
@@ -167,6 +168,10 @@ function createHarness(options: {
 	cwd?: string;
 	swarmsRoot: string;
 	stayWorking?: boolean;
+	mode?: ExtensionContext["mode"];
+	hasUI?: boolean;
+	overlayOptions?: SwarmOverlayOptions;
+	customHandler?: () => Promise<unknown>;
 }): { harness: ExtensionHarness; sessions: Map<string, MockWorkerSession> } {
 	const tools = new Map<string, ToolDefinition>();
 	const commands = new Map<string, Omit<RegisteredCommand, "name" | "sourceInfo">>();
@@ -187,8 +192,8 @@ function createHarness(options: {
 	const model = makeModel();
 
 	const ctx = {
-		mode: "tui",
-		hasUI: true,
+		mode: options.mode ?? "tui",
+		hasUI: options.hasUI ?? true,
 		cwd,
 		model,
 		scopedModels: [{ model }],
@@ -225,6 +230,9 @@ function createHarness(options: {
 			getEditorText: () => "",
 			custom: vi.fn(async () => {
 				overlayCalls += 1;
+				if (options.customHandler) {
+					return options.customHandler();
+				}
 				return undefined;
 			}),
 		},
@@ -262,6 +270,7 @@ function createHarness(options: {
 
 	const factory = createSwarmExtension({
 		swarmsRoot: options.swarmsRoot,
+		overlayOptions: options.overlayOptions,
 		sessionFactory: async (workerCtx) => {
 			const s = new MockWorkerSession(workerCtx, { stayWorking: options.stayWorking });
 			sessions.set(workerCtx.member.name, s);
@@ -679,5 +688,67 @@ describe("pi-swarm extension", () => {
 		await harness.emit("agent_settled", { type: "agent_settled", aborted: false });
 		expect(harness.sentMessages).toHaveLength(1);
 		expect(String(harness.sentMessages[0].message.content)).toContain("Second");
+	});
+
+	it("loops Overlay <-> WorkerView cleanly via /swarm ui and Alt+S without interrupting active workers, and handles non-TUI modes safely", async () => {
+		const swarmsRoot = makeTempDir("pi-swarm-ext-loop-");
+		let customCallCount = 0;
+		const openWorkerView = vi
+			.fn()
+			.mockResolvedValueOnce({ kind: "open_overlay", tab: "workers" })
+			.mockResolvedValueOnce(undefined);
+
+		const { harness, sessions } = createHarness({
+			swarmsRoot,
+			stayWorking: true,
+			overlayOptions: { openWorkerView },
+			customHandler: async () => {
+				customCallCount += 1;
+				if (customCallCount === 1) {
+					return { kind: "open_worker", workerName: "worker-a", returnTab: "overview" } satisfies SwarmOverlayResult;
+				}
+				if (customCallCount === 2) {
+					return { kind: "open_worker", workerName: "worker-a", returnTab: "workers" } satisfies SwarmOverlayResult;
+				}
+				return undefined;
+			},
+		});
+
+		const swarmCmd = harness.commands.get("swarm")!;
+		await swarmCmd.handler("Run task", harness.ctx);
+		const swarmTool = harness.tools.get("swarm")!;
+		await swarmTool.execute(
+			"tc-add",
+			{ action: "add", name: "worker-a", brief: "Stay active" },
+			undefined,
+			undefined,
+			harness.ctx as unknown as ExtensionToolContext,
+		);
+		await new Promise((r) => setTimeout(r, 20));
+
+		// /swarm ui triggers overlay -> worker view -> reopened overlay -> worker view -> coordinator UI
+		await swarmCmd.handler("ui", harness.ctx);
+		expect(harness.overlayCalls).toBe(2);
+		expect(openWorkerView).toHaveBeenCalledTimes(2);
+		expect(sessions.get("worker-a")?.abortedCount).toBe(0);
+
+		// Non-TUI modes (print / json / rpc) output plain summary safely without crashing
+		for (const mode of ["print", "json", "rpc"] as const) {
+			const fallbackLines: string[] = [];
+			const nonTui = createHarness({
+				swarmsRoot: makeTempDir(`pi-swarm-${mode}-`),
+				mode,
+				hasUI: mode === "rpc",
+				overlayOptions: { writeFallback: (text) => fallbackLines.push(text) },
+			});
+			const cmd = nonTui.harness.commands.get("swarm")!;
+			await cmd.handler("Headless task", nonTui.harness.ctx);
+			await cmd.handler("ui", nonTui.harness.ctx);
+			if (mode === "rpc") {
+				expect(nonTui.harness.notifications.some((n) => n.msg.includes("Swarm:"))).toBe(true);
+			} else {
+				expect(fallbackLines.some((t) => t.includes("Swarm:"))).toBe(true);
+			}
+		}
 	});
 });
