@@ -41,7 +41,7 @@ function missingPiDepsFallbackPlugin() {
 		},
 		load(id: string) {
 			if (id === `${VIRTUAL_DEP_PREFIX}marked-cjk-friendly.mjs`) {
-				return "export default function markedCjkFriendly() { return {}; }";
+				return "export default function markedCjkFriendly() { return { tokenizer: { emStrong() { return false; } } }; }";
 			}
 			if (id === `${VIRTUAL_DEP_PREFIX}lovely-mermaid.mjs`) {
 				return 'export function render() { return { lines: [] }; }\nexport function toAnsi() { return ""; }';
