@@ -387,6 +387,11 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 		this.dockInputContainer.clear();
 		const th = this.theme;
 
+		const member = this.getMember();
+		if (!member || member.state === "killed") {
+			this.modal = { kind: "none" };
+		}
+
 		if (this.modal.kind === "confirm_kill") {
 			this.editor.focused = false;
 			this.dockInputContainer.addChild(
@@ -409,8 +414,10 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 			return;
 		}
 
-		const member = this.getMember();
 		if (!member || member.state === "killed") {
+			if (this.editor.isShowingAutocomplete()) {
+				this.editor.handleInput("\x1b");
+			}
 			this.editor.disableSubmit = true;
 			this.editor.focused = false;
 			this.dockInputContainer.addChild(
@@ -493,6 +500,7 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 		void this.manager
 			.sendDirectWorkerMessage(this.workerName, text, delivery)
 			.then((res) => {
+				if (this.closed) return;
 				if (res.resumed) {
 					this.setStatus(`Resumed ${this.workerName}.`);
 				}
@@ -500,6 +508,7 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 				this.refreshNow();
 			})
 			.catch((err: unknown) => {
+				if (this.closed) return;
 				this.setStatus(err instanceof Error ? err.message : String(err), true);
 				this.refreshNow();
 			});
@@ -624,17 +633,24 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 		void this.manager
 			.switchWorkerModelByUser(this.workerName, modelRef, this.ctx.modelRegistry)
 			.then((res) => {
+				if (this.closed) return;
 				this.setStatus(`Switched ${res.target} to ${res.model}${res.woke ? " (resumed)" : ""}.`);
 				this.footerController.invalidate();
 				this.refreshNow();
 			})
 			.catch((err: unknown) => {
+				if (this.closed) return;
 				this.setStatus(`Model switch failed: ${err instanceof Error ? err.message : String(err)}`, true);
 				this.refreshNow();
 			});
 	}
 
 	handleInput(data: string): void {
+		const member = this.getMember();
+		if (!member || member.state === "killed") {
+			this.modal = { kind: "none" };
+		}
+
 		if (this.modal.kind === "confirm_kill") {
 			if (data === "y" || data === "Y" || matchesKey(data, "enter") || matchesKey(data, "return")) {
 				this.modal = { kind: "none" };
@@ -643,11 +659,13 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 				void this.manager
 					.killWorkerByUser(this.workerName)
 					.then((res) => {
+						if (this.closed) return;
 						this.setStatus(`Killed ${res.killed.join(", ")}. View is now read-only.`);
 						this.footerController.invalidate();
 						this.refreshNow();
 					})
 					.catch((err: unknown) => {
+						if (this.closed) return;
 						this.setStatus(`Kill failed: ${err instanceof Error ? err.message : String(err)}`, true);
 						this.refreshNow();
 					});
@@ -774,7 +792,9 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 		}
 
 		this.editor.handleInput(data);
-		this.tui.requestRender();
+		if (!this.closed) {
+			this.tui.requestRender();
+		}
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {

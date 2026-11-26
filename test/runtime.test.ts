@@ -2006,4 +2006,126 @@ describe("SwarmManager runtime mechanics", () => {
 		// Idle abort is a safe no-op
 		expect(await manager.abortWorkerByUser("helper")).toEqual({ aborted: false, state: "waiting" });
 	});
+
+	it("clears native/tracked and fallback queued messages on abortWorkerByUser and rejects model switch if killed during setModel", async () => {
+		const cwd = makeTempDir("pi-swarm-abort-queue-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-abort-queue-root-");
+		const modelA = makeModel("p", "a");
+		const modelB = makeModel("p", "b");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA, modelB], SessionManager.inMemory(cwd));
+
+		let releaseWork: (() => void) | undefined;
+		let releaseSetModel: (() => void) | undefined;
+
+		class NativeQueueAbortSession extends MockWorkerSession {
+			steeringQueue: string[] = [];
+			followUpQueue: string[] = [];
+
+			async steer(text: string): Promise<"queued"> {
+				this.steeringQueue.push(text);
+				return "queued";
+			}
+
+			async followUp(text: string): Promise<"queued"> {
+				this.followUpQueue.push(text);
+				return "queued";
+			}
+
+			getSteeringMessages(): readonly string[] {
+				return this.steeringQueue;
+			}
+
+			getFollowUpMessages(): readonly string[] {
+				return this.followUpQueue;
+			}
+
+			clearQueue(): { steering: string[]; followUp: string[] } {
+				const steering = [...this.steeringQueue];
+				const followUp = [...this.followUpQueue];
+				this.steeringQueue = [];
+				this.followUpQueue = [];
+				return { steering, followUp };
+			}
+		}
+
+		class TrackedOnlySession extends MockWorkerSession {
+			async steer(): Promise<"queued"> {
+				return "queued";
+			}
+		}
+
+		const manager = new SwarmManager({
+			sessionId: "sess-abort-queue",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				if (ctx.member.name === "native-q") {
+					return new NativeQueueAbortSession(ctx, async (_p, s) => {
+						await new Promise<void>((resolve) => {
+							releaseWork = resolve;
+						});
+						s.emitAssistantSuccess("done");
+					});
+				}
+				if (ctx.member.name === "tracked-q") {
+					return new TrackedOnlySession(ctx, async () => {
+						await new Promise<void>(() => {});
+					});
+				}
+				const s = new MockWorkerSession(ctx, (_p, sess) => sess.emitAssistantSuccess("ok"));
+				s.setModel = async () => {
+					await new Promise<void>((resolve) => {
+						releaseSetModel = resolve;
+					});
+				};
+				return s;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "native-q", brief: "Work" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "tracked-q", brief: "Work 2" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "race-w", brief: "Work 3" }, "coordinator", hostCtx);
+		await waitForCondition(() => releaseWork !== undefined);
+		await flushMicrotasks();
+
+		await manager.sendDirectWorkerMessage("native-q", "steer-msg", "steer");
+		await manager.sendDirectWorkerMessage("native-q", "follow-msg", "followUp");
+		await manager.sendDirectWorkerMessage("tracked-q", "tracked-steer", "steer");
+
+		expect(manager.getWorkerQueuedMessages("native-q")).toEqual({
+			steering: ["steer-msg"],
+			followUp: ["follow-msg"],
+		});
+		expect(manager.getWorkerQueuedMessages("tracked-q")).toEqual({
+			steering: ["tracked-steer"],
+			followUp: [],
+		});
+
+		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
+		manager.subscribeWorkerEvents("native-q", (ev) => {
+			if (ev.type === "queue_update") {
+				queueEvents.push({ steering: [...ev.steering], followUp: [...ev.followUp] });
+			}
+		});
+
+		const abortRes = await manager.abortWorkerByUser("native-q");
+		expect(abortRes).toEqual({ aborted: true, state: "waiting" });
+		expect(manager.getWorkerQueuedMessages("native-q")).toEqual({ steering: [], followUp: [] });
+		expect(queueEvents.some((e) => e.steering.length === 0 && e.followUp.length === 0)).toBe(true);
+
+		await manager.abortWorkerByUser("tracked-q");
+		expect(manager.getWorkerQueuedMessages("tracked-q")).toEqual({ steering: [], followUp: [] });
+
+		releaseWork!();
+
+		// Race killWorkerByUser against in-flight switchWorkerModelByUser
+		const switchPromise = manager.switchWorkerModelByUser("race-w", "p/b");
+		await waitForCondition(() => releaseSetModel !== undefined);
+		await manager.killWorkerByUser("race-w");
+		releaseSetModel!();
+		await expect(switchPromise).rejects.toThrow(/killed/);
+		expect(manager.getBoard().getMember("race-w")?.state).toBe("killed");
+	});
 });

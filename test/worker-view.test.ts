@@ -798,4 +798,33 @@ describe("SwarmWorkerViewComponent — Issue 05: Slash Commands & CombinedAutoco
 		expect(mgr2.getSnapshot().members.find((m) => m.name === "parser")?.state).toBe("working");
 		view.dispose();
 	});
+
+	it("clears queued steering/followUp banner on Esc abort and dismisses autocomplete/modal if killed externally", async () => {
+		const { mgr, ctx } = await setupSwarmWithWorker({ holdWorker: true });
+		const view = new SwarmWorkerViewComponent(makeFakeTui(24), testTheme, testKeybindings, mgr, ctx, "parser", vi.fn(), {
+			throttleMs: 0,
+		});
+
+		view.editor.setText("Pending steer");
+		view.handleInput("\r");
+		await new Promise((r) => setTimeout(r, 20));
+		expect(view.render(100).map(stripTerminalSequences).join("\n")).toContain("Steering: Pending steer");
+
+		// Esc aborts working worker and clears queued steering display immediately
+		view.handleInput("\x1b");
+		await new Promise((r) => setTimeout(r, 25));
+		const afterAbort = view.render(100).map(stripTerminalSequences).join("\n");
+		expect(afterAbort).not.toContain("Steering: Pending steer");
+		expect(afterAbort).toContain("[waiting]");
+
+		// Open autocomplete, then kill worker externally -> autocomplete dismisses & PgUp scrolling works
+		view.handleInput("/");
+		await new Promise((r) => setTimeout(r, 20));
+		expect(view.editor.isShowingAutocomplete()).toBe(true);
+
+		await mgr.killWorkerByUser("parser");
+		expect(view.editor.isShowingAutocomplete()).toBe(false);
+		expect(view.render(100).map(stripTerminalSequences).join("\n")).toContain("[read-only]");
+		view.dispose();
+	});
 });

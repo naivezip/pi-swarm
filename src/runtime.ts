@@ -1461,13 +1461,17 @@ export class SwarmManager {
 				break;
 			}
 			case "message_start": {
-				if (event.message.role === "user" && !runtime.session.getSteeringMessages) {
+				if (event.message.role === "user") {
 					const msgText = extractUserMessageText(event.message);
-					const steerIdx = runtime.trackedSteering.indexOf(msgText);
-					if (steerIdx !== -1) {
-						runtime.trackedSteering.splice(steerIdx, 1);
-						this.emitSnapshot();
-					} else {
+					if (!runtime.session.getSteeringMessages) {
+						const steerIdx = runtime.trackedSteering.indexOf(msgText);
+						if (steerIdx !== -1) {
+							runtime.trackedSteering.splice(steerIdx, 1);
+							this.emitSnapshot();
+							break;
+						}
+					}
+					if (!runtime.session.getFollowUpMessages) {
 						const followIdx = runtime.trackedFollowUp.indexOf(msgText);
 						if (followIdx !== -1) {
 							runtime.trackedFollowUp.splice(followIdx, 1);
@@ -1536,6 +1540,34 @@ export class SwarmManager {
 		this.pendingWorkerProcessEvents.set(memberName, queue);
 	}
 
+	private clearWorkerQueues(memberName: string, runtime: ActiveWorkerRuntime): void {
+		const before = this.getWorkerQueuedMessages(memberName);
+		const hadAny =
+			before.steering.length > 0 ||
+			before.followUp.length > 0 ||
+			runtime.trackedSteering.length > 0 ||
+			runtime.trackedFollowUp.length > 0 ||
+			runtime.fallbackQueuedSteering.length > 0 ||
+			runtime.fallbackQueuedFollowUp.length > 0;
+
+		runtime.queueUpdateSeen = false;
+		runtime.trackedSteering.length = 0;
+		runtime.trackedFollowUp.length = 0;
+		runtime.fallbackQueuedSteering.length = 0;
+		runtime.fallbackQueuedFollowUp.length = 0;
+		runtime.session.clearQueue?.();
+
+		if (hadAny && !runtime.queueUpdateSeen) {
+			const queued = this.getWorkerQueuedMessages(memberName);
+			this.emitWorkerEvent(memberName, {
+				type: "queue_update",
+				steering: queued.steering,
+				followUp: queued.followUp,
+			});
+			this.emitSnapshot();
+		}
+	}
+
 	private onWorkerSettled(member: MemberRecord, runtime: ActiveWorkerRuntime, aborted: boolean): void {
 		if (this.disposed || member.state === "killed") {
 			return;
@@ -1562,6 +1594,7 @@ export class SwarmManager {
 
 		if (wasAborted || runtime.lastTurnErrored) {
 			if (wasAborted) {
+				this.clearWorkerQueues(member.name, runtime);
 				this.pendingWorkerWakeSeq.delete(member.name);
 				this.pendingWorkerScheduleWake.delete(member.name);
 				this.pendingWorkerProcessEvents.delete(member.name);
@@ -1753,10 +1786,21 @@ export class SwarmManager {
 			if (effectiveDelivery === "followUp") {
 				if (runtime.session.followUp) {
 					runtime.queueUpdateSeen = false;
-					if (!runtime.session.getFollowUpMessages) {
+					const trackFallback = !runtime.session.getFollowUpMessages;
+					if (trackFallback) {
 						runtime.trackedFollowUp.push(text);
 					}
-					await runtime.session.followUp(text);
+					try {
+						await runtime.session.followUp(text);
+					} catch (err) {
+						if (trackFallback && !runtime.queueUpdateSeen) {
+							const idx = runtime.trackedFollowUp.lastIndexOf(text);
+							if (idx !== -1) {
+								runtime.trackedFollowUp.splice(idx, 1);
+							}
+						}
+						throw err;
+					}
 					if (!runtime.queueUpdateSeen) {
 						const queued = this.getWorkerQueuedMessages(name);
 						this.emitWorkerEvent(name, {
@@ -1779,10 +1823,21 @@ export class SwarmManager {
 			} else {
 				if (runtime.session.steer) {
 					runtime.queueUpdateSeen = false;
-					if (!runtime.session.getSteeringMessages) {
+					const trackFallback = !runtime.session.getSteeringMessages;
+					if (trackFallback) {
 						runtime.trackedSteering.push(text);
 					}
-					await runtime.session.steer(text);
+					try {
+						await runtime.session.steer(text);
+					} catch (err) {
+						if (trackFallback && !runtime.queueUpdateSeen) {
+							const idx = runtime.trackedSteering.lastIndexOf(text);
+							if (idx !== -1) {
+								runtime.trackedSteering.splice(idx, 1);
+							}
+						}
+						throw err;
+					}
 					if (!runtime.queueUpdateSeen) {
 						const queued = this.getWorkerQueuedMessages(name);
 						this.emitWorkerEvent(name, {
@@ -1864,18 +1919,7 @@ export class SwarmManager {
 		}
 
 		runtime.abortRequestedByUser = true;
-		const hadFallbackQueue =
-			runtime.fallbackQueuedSteering.length > 0 || runtime.fallbackQueuedFollowUp.length > 0;
-		runtime.fallbackQueuedSteering.length = 0;
-		runtime.fallbackQueuedFollowUp.length = 0;
-		if (hadFallbackQueue) {
-			const queued = this.getWorkerQueuedMessages(name);
-			this.emitWorkerEvent(name, {
-				type: "queue_update",
-				steering: queued.steering,
-				followUp: queued.followUp,
-			});
-		}
+		this.clearWorkerQueues(name, runtime);
 
 		try {
 			await runtime.session.abort();
@@ -2316,6 +2360,10 @@ export class SwarmManager {
 		let runtime = this.activeWorkers.get(target);
 		if (runtime) {
 			await runtime.session.setModel(resolvedModel);
+			const refreshed = this.board.getMember(target);
+			if (this.disposed || !refreshed || refreshed.state === "killed") {
+				throw new Error(`Worker "${target}" has been killed.`);
+			}
 		}
 
 		member.model = newModelRef;
@@ -2665,6 +2713,7 @@ export class SwarmManager {
 
 			const entries = [...this.activeWorkers.entries()];
 			for (const [name, runtime] of entries) {
+				this.clearWorkerQueues(name, runtime);
 				try {
 					await runtime.session.abort();
 				} catch {
