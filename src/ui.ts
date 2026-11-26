@@ -17,15 +17,26 @@ export const SWARM_WIDGET_KEY = "pi-swarm";
 
 export type SwarmOverlayTab = "overview" | "board" | "workers";
 
-export type SwarmOverlayResult = {
-	kind: "prefill";
-	text: string;
-};
+export type SwarmOverlayResult =
+	| { kind: "prefill"; text: string }
+	| { kind: "open_worker"; workerName: string; returnTab: "overview" | "workers" };
+
+export type OpenWorkerViewHandler = (
+	ctx: ExtensionContext,
+	manager: SwarmManager,
+	workerName: string,
+	options?: {
+		throttleMs?: number;
+		returnTab?: SwarmOverlayTab;
+		writeFallback?: (text: string) => void;
+	},
+) => Promise<{ kind: "open_overlay"; tab?: SwarmOverlayTab } | undefined>;
 
 export interface SwarmOverlayOptions {
 	initialTab?: SwarmOverlayTab;
 	throttleMs?: number;
 	writeFallback?: (text: string) => void;
+	openWorkerView?: OpenWorkerViewHandler;
 }
 
 const DEFAULT_THROTTLE_MS = 80;
@@ -635,6 +646,8 @@ export class SwarmOverlayComponent implements Component {
 
 	private activeTab: SwarmOverlayTab;
 	private overviewScroll = 0;
+	private overviewSelectedWorker: string | undefined;
+	private overviewEnsureSelectedVisible = false;
 	private boardScroll = 0;
 	private boardSelectedIndex = -1;
 	private channelFilterIndex = 0;
@@ -732,6 +745,50 @@ export class SwarmOverlayComponent implements Component {
 		const clamped = Math.max(0, Math.min(this.workerSelectedIndex, snapshot.members.length - 1));
 		this.workerSelectedIndex = clamped;
 		return snapshot.members[clamped];
+	}
+
+	private getOverviewSelectableWorkers(snapshot: SwarmSnapshot): string[] {
+		const memberMap = new Map(snapshot.members.map((m) => [m.name, m]));
+		const selectable: string[] = [];
+		const hasPlan =
+			snapshot.plan.goal.title.trim().length > 0 ||
+			snapshot.plan.threads.length > 0 ||
+			Object.keys(snapshot.plan.tasks).length > 0;
+
+		if (hasPlan) {
+			for (const thread of snapshot.plan.threads) {
+				for (const workerName of thread.tasks) {
+					if (memberMap.has(workerName)) {
+						selectable.push(workerName);
+					}
+				}
+			}
+			const threadedNames = new Set(snapshot.plan.threads.flatMap((t) => t.tasks));
+			for (const m of snapshot.members) {
+				if (!threadedNames.has(m.name)) {
+					selectable.push(m.name);
+				}
+			}
+			return selectable;
+		}
+
+		for (const m of snapshot.members) {
+			selectable.push(m.name);
+		}
+		return selectable;
+	}
+
+	private resolveOverviewSelectedIndex(selectable: readonly string[]): number {
+		if (selectable.length === 0) {
+			return -1;
+		}
+		if (this.overviewSelectedWorker !== undefined) {
+			const idx = selectable.indexOf(this.overviewSelectedWorker);
+			if (idx >= 0) {
+				return idx;
+			}
+		}
+		return 0;
 	}
 
 	handleInput(data: string): void {
@@ -861,18 +918,41 @@ export class SwarmOverlayComponent implements Component {
 
 		// Per-tab input
 		if (this.activeTab === "overview") {
+			const selectable = this.getOverviewSelectableWorkers(snapshot);
 			if (matchesKey(data, "up")) {
-				this.overviewScroll = Math.max(0, this.overviewScroll - 1);
+				if (selectable.length === 0) {
+					this.overviewScroll = Math.max(0, this.overviewScroll - 1);
+				} else {
+					const curIdx = this.resolveOverviewSelectedIndex(selectable);
+					const nextIdx = Math.max(0, curIdx - 1);
+					this.overviewSelectedWorker = selectable[nextIdx];
+					this.overviewEnsureSelectedVisible = true;
+				}
 				this.refreshNow();
 			} else if (matchesKey(data, "down")) {
-				this.overviewScroll += 1;
+				if (selectable.length === 0) {
+					this.overviewScroll += 1;
+				} else {
+					const curIdx = this.resolveOverviewSelectedIndex(selectable);
+					const nextIdx = Math.min(selectable.length - 1, curIdx + 1);
+					this.overviewSelectedWorker = selectable[nextIdx];
+					this.overviewEnsureSelectedVisible = true;
+				}
 				this.refreshNow();
 			} else if (matchesKey(data, "pageUp")) {
+				this.overviewEnsureSelectedVisible = false;
 				this.overviewScroll = Math.max(0, this.overviewScroll - 8);
 				this.refreshNow();
 			} else if (matchesKey(data, "pageDown")) {
+				this.overviewEnsureSelectedVisible = false;
 				this.overviewScroll += 8;
 				this.refreshNow();
+			} else if (matchesKey(data, "enter") || matchesKey(data, "return")) {
+				const curIdx = this.resolveOverviewSelectedIndex(selectable);
+				const chosen = curIdx >= 0 ? selectable[curIdx] : undefined;
+				if (chosen) {
+					this.done({ kind: "open_worker", workerName: chosen, returnTab: "overview" });
+				}
 			}
 			return;
 		}
@@ -980,6 +1060,10 @@ export class SwarmOverlayComponent implements Component {
 			return;
 		}
 		if (!selected) {
+			return;
+		}
+		if (matchesKey(data, "enter") || matchesKey(data, "return")) {
+			this.done({ kind: "open_worker", workerName: selected.name, returnTab: "workers" });
 			return;
 		}
 		if (data === "k") {
@@ -1122,6 +1206,24 @@ export class SwarmOverlayComponent implements Component {
 		const th = this.theme;
 		const content: string[] = [];
 		const memberMap = new Map(snapshot.members.map((m) => [m.name, m]));
+		const selectable = this.getOverviewSelectableWorkers(snapshot);
+		const selectedIdx = this.resolveOverviewSelectedIndex(selectable);
+		let selectableCursor = 0;
+		let selectedRowIndex: number | undefined;
+
+		const pushWorkerRow = (workerName: string, member: MemberStatusSummary | undefined, taskDesc: string): void => {
+			let isSelected = false;
+			if (member) {
+				isSelected = selectableCursor === selectedIdx;
+				if (isSelected) {
+					selectedRowIndex = content.length;
+				}
+				selectableCursor += 1;
+			}
+			content.push(
+				truncateToWidth(this.formatOverviewWorkerRow(snapshot, workerName, member, taskDesc, isSelected), innerW),
+			);
+		};
 
 		const hasPlan =
 			snapshot.plan.goal.title.trim().length > 0 ||
@@ -1144,7 +1246,7 @@ export class SwarmOverlayComponent implements Component {
 					for (const workerName of thread.tasks) {
 						const member = memberMap.get(workerName);
 						const taskDesc = snapshot.plan.tasks[workerName] ?? "";
-						content.push(truncateToWidth(this.formatOverviewWorkerRow(snapshot, workerName, member, taskDesc), innerW));
+						pushWorkerRow(workerName, member, taskDesc);
 					}
 					content.push("");
 				}
@@ -1156,12 +1258,7 @@ export class SwarmOverlayComponent implements Component {
 			if (unthreaded.length > 0) {
 				content.push(` ${th.fg("dim", "Unassigned workers")}`);
 				for (const m of unthreaded) {
-					content.push(
-						truncateToWidth(
-							this.formatOverviewWorkerRow(snapshot, m.name, m, snapshot.plan.tasks[m.name] ?? ""),
-							innerW,
-						),
-					);
+					pushWorkerRow(m.name, m, snapshot.plan.tasks[m.name] ?? "");
 				}
 				content.push("");
 			}
@@ -1180,7 +1277,7 @@ export class SwarmOverlayComponent implements Component {
 				content.push(`   ${th.fg("dim", "(none)")}`);
 			} else {
 				for (const m of snapshot.members) {
-					content.push(truncateToWidth(this.formatOverviewWorkerRow(snapshot, m.name, m, ""), innerW));
+					pushWorkerRow(m.name, m, "");
 				}
 			}
 			content.push("");
@@ -1199,6 +1296,15 @@ export class SwarmOverlayComponent implements Component {
 			}
 		}
 
+		if (this.overviewEnsureSelectedVisible && selectedRowIndex !== undefined) {
+			if (selectedRowIndex < this.overviewScroll) {
+				this.overviewScroll = selectedRowIndex;
+			} else if (selectedRowIndex >= this.overviewScroll + bodyHeight) {
+				this.overviewScroll = selectedRowIndex - bodyHeight + 1;
+			}
+			this.overviewEnsureSelectedVisible = false;
+		}
+
 		const maxScroll = Math.max(0, content.length - bodyHeight);
 		this.overviewScroll = Math.max(0, Math.min(this.overviewScroll, maxScroll));
 		return content.slice(this.overviewScroll, this.overviewScroll + bodyHeight);
@@ -1209,20 +1315,23 @@ export class SwarmOverlayComponent implements Component {
 		workerName: string,
 		member: MemberStatusSummary | undefined,
 		taskDesc: string,
+		selected = false,
 	): string {
 		const th = this.theme;
 		if (!member) {
 			return `   ${th.fg("dim", "?")} ${th.bold(workerName)} ${taskDesc ? th.fg("muted", `- ${taskDesc}`) : ""}`;
 		}
+		const prefix = selected ? ` ${th.fg("accent", ">")} ` : "   ";
 		const color = getStateColor(member.state);
 		const glyph = th.fg(color, getStateGlyph(member.state));
+		const nameText = selected ? th.fg("accent", th.bold(workerName)) : th.bold(workerName);
 		const stateStr = th.fg(color, member.state);
 		const desc = taskDesc ? ` ${th.fg("muted", `- ${taskDesc}`)}` : "";
 		const bgProcs = getActiveMemberProcesses(snapshot, member);
 		const bgBadge = bgProcs.length > 0 ? ` ${formatOverlayBgBadge(bgProcs, th)}` : "";
 		const activity = member.currentActivity ? ` ${th.fg("dim", `(${member.currentActivity})`)}` : "";
 		const err = member.lastError ? ` ${th.fg("error", `[err]`)}` : "";
-		return `   ${glyph} ${th.bold(workerName)} [${stateStr}]${desc}${bgBadge}${activity}${err}`;
+		return `${prefix}${glyph} ${nameText} [${stateStr}]${desc}${bgBadge}${activity}${err}`;
 	}
 
 	private renderBoardBody(snapshot: SwarmSnapshot, innerW: number, bodyHeight: number): string[] {
@@ -1420,12 +1529,12 @@ export class SwarmOverlayComponent implements Component {
 		const th = this.theme;
 		const status = this.statusNote ? `${th.fg("warning", this.statusNote)}  ${th.fg("dim", "│")}  ` : "";
 		if (this.activeTab === "overview") {
-			return ` ${status}${th.fg("dim", "1-3/Tab/Left/Right tabs · Up/Down/PgUp/PgDn scroll · Esc/q close")}`;
+			return ` ${status}${th.fg("dim", "1-3/Tab/Left/Right tabs · Up/Down select · Enter open worker · PgUp/PgDn scroll · Esc/q close")}`;
 		}
 		if (this.activeTab === "board") {
 			return ` ${status}${th.fg("dim", "Up/Down select · c channel · m member · r/Enter prefill #seq · Esc/q close")}`;
 		}
-		return ` ${status}${th.fg("dim", "Up/Down worker · PgUp/PgDn transcript · k kill · M model · S stop all · Esc/q close")}`;
+		return ` ${status}${th.fg("dim", "Up/Down worker · Enter open · PgUp/PgDn transcript · k kill · M model · S stop all · Esc/q close")}`;
 	}
 
 	invalidate(): void {
@@ -1443,6 +1552,19 @@ export class SwarmOverlayComponent implements Component {
 			this.throttleTimer = undefined;
 		}
 		this.pendingRender = false;
+	}
+}
+
+async function loadDefaultOpenWorkerView(): Promise<OpenWorkerViewHandler | undefined> {
+	try {
+		// Dynamically resolved until src/worker-view.ts is merged alongside src/ui.ts.
+		const modulePath: string = "./worker-view.ts";
+		const mod = (await import(/* @vite-ignore */ modulePath)) as {
+			openWorkerView?: OpenWorkerViewHandler;
+		};
+		return typeof mod.openWorkerView === "function" ? mod.openWorkerView : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -1470,25 +1592,55 @@ export async function openSwarmOverlay(
 		return undefined;
 	}
 
-	const result = await ctx.ui.custom<SwarmOverlayResult | undefined>(
-		(tui, theme, keybindings, done) =>
-			new SwarmOverlayComponent(tui, theme, keybindings, manager, ctx, done, options),
-		{
-			overlay: true,
-			overlayOptions: {
-				anchor: "center",
-				width: "92%",
-				minWidth: 60,
-				maxHeight: "88%",
-				margin: 1,
+	let currentTab: SwarmOverlayTab | undefined = options?.initialTab;
+	let openWorkerViewHandler = options?.openWorkerView;
+
+	while (true) {
+		const loopOptions: SwarmOverlayOptions = {
+			...options,
+			initialTab: currentTab,
+		};
+		const result = await ctx.ui.custom<SwarmOverlayResult | undefined>(
+			(tui, theme, keybindings, done) =>
+				new SwarmOverlayComponent(tui, theme, keybindings, manager, ctx, done, loopOptions),
+			{
+				overlay: true,
+				overlayOptions: {
+					anchor: "center",
+					width: "92%",
+					minWidth: 60,
+					maxHeight: "88%",
+					margin: 1,
+				},
+				blocked: { kind: "question", message: "Swarm Board" },
 			},
-			blocked: { kind: "question", message: "Swarm Board" },
-		},
-	);
+		);
 
-	if (result?.kind === "prefill") {
-		ctx.ui.setEditorText(result.text);
+		if (result?.kind === "prefill") {
+			ctx.ui.setEditorText(result.text);
+			return result;
+		}
+
+		if (result?.kind === "open_worker") {
+			if (!openWorkerViewHandler) {
+				openWorkerViewHandler = await loadDefaultOpenWorkerView();
+			}
+			if (!openWorkerViewHandler) {
+				ctx.ui.notify(`Worker view is not available for "${result.workerName}".`, "warning");
+				return undefined;
+			}
+			const viewResult = await openWorkerViewHandler(ctx, manager, result.workerName, {
+				throttleMs: options?.throttleMs,
+				returnTab: result.returnTab,
+				writeFallback: options?.writeFallback,
+			});
+			if (viewResult?.kind === "open_overlay") {
+				currentTab = viewResult.tab ?? result.returnTab;
+				continue;
+			}
+			return undefined;
+		}
+
+		return result;
 	}
-
-	return result;
 }

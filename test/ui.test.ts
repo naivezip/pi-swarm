@@ -436,8 +436,11 @@ describe("SwarmOverlayComponent", () => {
 		// Press 'r' on selected message to prefill #seq
 		overlay.handleInput("r");
 		expect(done).toHaveBeenCalledTimes(1);
-		expect(done.mock.calls[0][0]?.kind).toBe("prefill");
-		expect(done.mock.calls[0][0]?.text).toMatch(/^#\d+ $/);
+		const prefillRes = done.mock.calls[0][0];
+		expect(prefillRes?.kind).toBe("prefill");
+		if (prefillRes?.kind === "prefill") {
+			expect(prefillRes.text).toMatch(/^#\d+ $/);
+		}
 
 		overlay.dispose();
 	});
@@ -481,9 +484,193 @@ describe("SwarmOverlayComponent", () => {
 		overlay.handleInput("S");
 		await new Promise((r) => setTimeout(r, 20));
 
+		// Move selection down to verifier and press Enter -> opens worker view from Workers tab
+		overlay.handleInput("\x1b[B"); // Down arrow -> verifier
+		overlay.handleInput("\r"); // Enter
+		expect(done).toHaveBeenCalledWith({
+			kind: "open_worker",
+			workerName: "verifier",
+			returnTab: "workers",
+		});
+
+		// Footer hint includes Enter open
+		expect(plain).toContain("Enter open");
+
 		// Close via 'q'
 		overlay.handleInput("q");
 		expect(done).toHaveBeenCalledWith(undefined);
+		overlay.dispose();
+	});
+
+	it("selects real workers in Overview (published plan + unassigned + no-plan), skips '?' placeholders, auto-scrolls, and handles Enter", async () => {
+		const { mgr, ctx } = await setupSwarm();
+		await mgr.addWorkers({ name: "extra", brief: "Extra unassigned work" }, "coordinator", ctx);
+		await new Promise((r) => setTimeout(r, 30));
+
+		const tui = makeFakeTui(28);
+		const done = vi.fn<(r: SwarmOverlayResult | undefined) => void>();
+		const overlay = new SwarmOverlayComponent(tui, testTheme, testKeybindings, mgr, ctx, done, {
+			initialTab: "overview",
+		});
+
+		// 1. No-plan fallback roster: Up/Down moves cursor across real workers and Enter opens selected
+		let plain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toContain("Enter open worker");
+		expect(plain).toMatch(/>\s+o\s+parser/);
+		overlay.handleInput("\x1b[B"); // Down -> verifier
+		plain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toMatch(/>\s+o\s+verifier/);
+		overlay.handleInput("\r"); // Enter -> open verifier
+		expect(done).toHaveBeenLastCalledWith({
+			kind: "open_worker",
+			workerName: "verifier",
+			returnTab: "overview",
+		});
+
+		// 2. Published plan with '?' placeholders + unassigned section: skips '?' rows
+		mgr.setPlan({
+			goal: { title: "Multi-thread plan", line: "Verify cursor skipping and unassigned workers." },
+			tasks: {
+				"ghost-1": "Not yet created",
+				parser: "Parse input",
+				"ghost-2": "Also not created",
+				verifier: "Check output",
+				extra: "Unassigned helper",
+			},
+			threads: [
+				{
+					id: "t-1",
+					title: "Thread One",
+					goal: "First thread",
+					tasks: ["ghost-1", "parser", "ghost-2", "verifier"],
+				},
+			],
+		});
+		overlay.invalidate();
+		plain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		// Selected worker remains verifier; ghost rows never get '>' cursor
+		expect(plain).toMatch(/\s+\?\s+ghost-1/);
+		expect(plain).toMatch(/\s+\?\s+ghost-2/);
+		expect(plain).not.toMatch(/>\s+\?\s+ghost/);
+		expect(plain).toMatch(/>\s+o\s+verifier/);
+
+		// Down from verifier crosses into Unassigned workers ('extra'), Up skips ghost-2 back to 'parser'
+		overlay.handleInput("\x1b[B"); // Down -> extra
+		plain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toMatch(/>\s+o\s+extra/);
+		overlay.handleInput("\r");
+		expect(done).toHaveBeenLastCalledWith({
+			kind: "open_worker",
+			workerName: "extra",
+			returnTab: "overview",
+		});
+
+		overlay.handleInput("\x1b[A"); // Up -> verifier
+		overlay.handleInput("\x1b[A"); // Up -> parser (skips ghost-2)
+		plain = overlay.render(110).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toMatch(/>\s+o\s+parser/);
+		overlay.handleInput("\r");
+		expect(done).toHaveBeenLastCalledWith({
+			kind: "open_worker",
+			workerName: "parser",
+			returnTab: "overview",
+		});
+
+		overlay.dispose();
+	});
+
+	it("auto-scrolls Overview viewport to keep selected worker visible while preserving PgUp/PgDn and empty-roster scroll fallback", async () => {
+		const dir = makeTempDir("pi-swarm-overview-scroll-");
+		const mgr = new SwarmManager({
+			sessionId: "s-scroll",
+			cwd: dir,
+			swarmDir: dir,
+			title: "Scroll Swarm",
+			sessionFactory: async (ctx) => new MockWorkerSession(ctx),
+		});
+		managersToDispose.push(mgr);
+		const mockCtx = makeMockContext(testTheme);
+		mgr.updateHostContext(mockCtx.ctx);
+
+		// Case A: zero real workers (only '?' planned placeholders) -> Up/Down scrolls, Enter is no-op
+		mgr.setPlan({
+			goal: { title: "Planned Only", line: "Many threads before workers are created" },
+			tasks: {},
+			threads: Array.from({ length: 10 }, (_, i) => ({
+				id: `t-${i}`,
+				title: `Thread ${i}`,
+				goal: `Goal ${i}`,
+				tasks: [`future-${i}`],
+			})),
+		});
+		const smallTui = makeFakeTui(18); // bodyHeight = 12
+		const doneEmpty = vi.fn<(r: SwarmOverlayResult | undefined) => void>();
+		const emptyOverlay = new SwarmOverlayComponent(smallTui, testTheme, testKeybindings, mgr, mockCtx.ctx, doneEmpty);
+
+		const topPlain = emptyOverlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(topPlain).toContain("Thread 0");
+		expect(topPlain).not.toContain("Thread 8");
+
+		for (let i = 0; i < 10; i++) {
+			emptyOverlay.handleInput("\x1b[B"); // Down scrolls when 0 real workers
+		}
+		const scrolledPlain = emptyOverlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(scrolledPlain).toContain("Thread 4");
+		emptyOverlay.handleInput("\r"); // Safe no-op
+		expect(doneEmpty).not.toHaveBeenCalled();
+		emptyOverlay.dispose();
+
+		// Case B: many real workers -> Down auto-scrolls viewport down, PgUp/PgDn page-scrolls, Up scrolls back up
+		for (let i = 0; i < 8; i++) {
+			await mgr.addWorkers({ name: `worker-${i}`, brief: `Task ${i}` }, "coordinator", mockCtx.ctx);
+		}
+		await new Promise((r) => setTimeout(r, 30));
+		mgr.setPlan({
+			goal: { title: "Scrollable Plan", line: "Verify auto-scroll on cursor movement" },
+			tasks: Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`worker-${i}`, `Task ${i}`])),
+			threads: Array.from({ length: 8 }, (_, i) => ({
+				id: `t-${i}`,
+				title: `Section ${i}`,
+				goal: `Goal ${i}`,
+				tasks: [`worker-${i}`],
+			})),
+		});
+
+		const doneWorkers = vi.fn<(r: SwarmOverlayResult | undefined) => void>();
+		const overlay = new SwarmOverlayComponent(smallTui, testTheme, testKeybindings, mgr, mockCtx.ctx, doneWorkers);
+
+		// Initially worker-0 is visible at top, worker-7 is off-screen below
+		let plain = overlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toMatch(/>\s+o\s+worker-0/);
+		expect(plain).not.toContain("worker-7");
+
+		// Press Down 7 times -> auto-scrolls viewport so worker-7 is visible and selected
+		for (let i = 0; i < 7; i++) {
+			overlay.handleInput("\x1b[B");
+		}
+		plain = overlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toMatch(/>\s+o\s+worker-7/);
+
+		// PgUp scrolls viewport up toward top without resetting to worker-7
+		overlay.handleInput("\x1b[5~"); // PageUp
+		overlay.handleInput("\x1b[5~"); // PageUp
+		overlay.handleInput("\x1b[5~"); // PageUp
+		plain = overlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toContain("Scrollable Plan");
+		expect(plain).not.toContain("worker-7");
+
+		// PgDn scrolls back down
+		overlay.handleInput("\x1b[6~"); // PageDown
+		plain = overlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).not.toContain("Scrollable Plan");
+
+		// Press Up 7 times from worker-7 -> auto-scrolls back up to keep worker-0 visible
+		for (let i = 0; i < 7; i++) {
+			overlay.handleInput("\x1b[A");
+		}
+		plain = overlay.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+		expect(plain).toMatch(/>\s+o\s+worker-0/);
+
 		overlay.dispose();
 	});
 });
@@ -540,6 +727,86 @@ describe("Non-TUI fallback and WidgetController", () => {
 
 		await openSwarmOverlay(tuiMock.ctx, mgr);
 		expect(tuiMock.editorText.value).toBe("#42 ");
+	});
+
+	it("loops cleanly between SwarmOverlay and WorkerView and exits to Coordinator on undefined", async () => {
+		const dir = makeTempDir("pi-swarm-loop-");
+		const mgr = new SwarmManager({
+			sessionId: "s-loop",
+			cwd: dir,
+			swarmDir: dir,
+			title: "Transition Loop Swarm",
+		});
+		managersToDispose.push(mgr);
+		const tuiMock = makeMockContext(testTheme, { mode: "tui", hasUI: true });
+		const seenInitialTabs: Array<string | undefined> = [];
+
+		const customMock = tuiMock.ctx.ui.custom as ReturnType<typeof vi.fn>;
+		customMock.mockImplementation(async (factory) => {
+			// Inspect the initialTab wired into SwarmOverlayComponent
+			const comp = factory(makeFakeTui(30), testTheme, testKeybindings, vi.fn()) as SwarmOverlayComponent;
+			const rendered = comp.render(100).map((l) => stripTerminalSequences(l)).join("\n");
+			if (rendered.includes("1-3/Tab/Left/Right tabs")) {
+				seenInitialTabs.push("overview");
+			} else if (rendered.includes("Up/Down worker")) {
+				seenInitialTabs.push("workers");
+			} else {
+				seenInitialTabs.push("board");
+			}
+			comp.dispose();
+
+			if (customMock.mock.calls.length === 1) {
+				return { kind: "open_worker", workerName: "parser", returnTab: "overview" } satisfies SwarmOverlayResult;
+			}
+			if (customMock.mock.calls.length === 2) {
+				return { kind: "open_worker", workerName: "verifier", returnTab: "workers" } satisfies SwarmOverlayResult;
+			}
+			return undefined;
+		});
+
+		const openWorkerView = vi
+			.fn()
+			.mockResolvedValueOnce({ kind: "open_overlay" }) // restores returnTab ("overview")
+			.mockResolvedValueOnce({ kind: "open_overlay", tab: "workers" }); // opens explicit tab ("workers")
+
+		const res1 = await openSwarmOverlay(tuiMock.ctx, mgr, {
+			initialTab: "overview",
+			openWorkerView,
+		});
+		expect(res1).toBeUndefined();
+		expect(seenInitialTabs).toEqual(["overview", "overview", "workers"]);
+		expect(openWorkerView).toHaveBeenNthCalledWith(
+			1,
+			tuiMock.ctx,
+			mgr,
+			"parser",
+			expect.objectContaining({ returnTab: "overview" }),
+		);
+		expect(openWorkerView).toHaveBeenNthCalledWith(
+			2,
+			tuiMock.ctx,
+			mgr,
+			"verifier",
+			expect.objectContaining({ returnTab: "workers" }),
+		);
+
+		// When openWorkerView returns undefined (Esc idle / Ctrl+D / /exit), exit directly without reopening overlay
+		customMock.mockClear();
+		openWorkerView.mockReset();
+		customMock.mockResolvedValueOnce({
+			kind: "open_worker",
+			workerName: "parser",
+			returnTab: "workers",
+		} satisfies SwarmOverlayResult);
+		openWorkerView.mockResolvedValueOnce(undefined);
+
+		const res2 = await openSwarmOverlay(tuiMock.ctx, mgr, {
+			initialTab: "workers",
+			openWorkerView,
+		});
+		expect(res2).toBeUndefined();
+		expect(customMock).toHaveBeenCalledTimes(1);
+		expect(openWorkerView).toHaveBeenCalledTimes(1);
 	});
 });
 
