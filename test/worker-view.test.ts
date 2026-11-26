@@ -17,6 +17,7 @@ import {
 	stripTerminalSequences,
 	type TUI,
 	TUI_KEYBINDINGS,
+	visibleWidth,
 	VStack,
 } from "@earendil-works/pi-tui";
 import {
@@ -485,6 +486,36 @@ describe("SwarmWorkerViewComponent — Issue 01: Layout, Streaming, Scrolling, T
 		expect(joined).toContain("test-provider/model-a");
 		view.dispose();
 	});
+
+	it("clips ANSI-styled user message lines cleanly on narrow viewports when scrollbar is visible", async () => {
+		const { mgr, sessions, ctx } = await setupSwarmWithWorker();
+		const session = sessions.get("parser")!;
+		const view = new SwarmWorkerViewComponent(makeFakeTui(18), testTheme, testKeybindings, mgr, ctx, "parser", vi.fn(), {
+			throttleMs: 0,
+		});
+		for (let i = 1; i <= 15; i++) {
+			session.emitEvent({
+				type: "message_start",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: `User message line ${i} with some extra text` }],
+					timestamp: Date.now(),
+				},
+			});
+		}
+
+		// Initial render establishes ScrollView layout bounds; PgUp then reveals the auto scrollbar
+		view.render(40);
+		view.handleInput("\x1b[5~");
+		const rawLines = view.render(40);
+		const transcriptLines = rawLines.slice(1, rawLines.length - 5);
+		const scrollbarLine = transcriptLines.find((l) => stripTerminalSequences(l).includes("User message"));
+		expect(scrollbarLine).toBeDefined();
+		expect(visibleWidth(scrollbarLine!)).toBeLessThanOrEqual(40);
+		expect(scrollbarLine!).toMatch(/\x1b\[0m.*(?:│|┃)/);
+		expect(stripTerminalSequences(scrollbarLine!)).toMatch(/(?:│|┃)$/);
+		view.dispose();
+	});
 });
 
 describe("SwarmWorkerViewComponent — Issue 03: Private Direct Chat, Steer/FollowUp, Auto-Resume & Killed Read-Only", () => {
@@ -736,6 +767,10 @@ describe("SwarmWorkerViewComponent — Issue 05: Slash Commands & CombinedAutoco
 		view.handleInput("\r");
 		await new Promise((r) => setTimeout(r, 30));
 		expect(mgr.getSnapshot().members.find((m) => m.name === "parser")?.model).toBe("test-provider/model-b");
+		// Native FooterComponent updates live to reflect the switched model
+		const afterModelPlain = view.render(100).map(stripTerminalSequences).join("\n");
+		expect(afterModelPlain).toContain("model-b");
+		expect(afterModelPlain).not.toContain("model-a");
 
 		// /kill prompts confirmation; 'n' cancels; 'y' confirms and switches to read-only
 		view.editor.setText("/kill");

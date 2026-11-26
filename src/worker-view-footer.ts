@@ -48,14 +48,26 @@ function adaptWorkerSessionForFooter(handle: WorkerSessionHandle, member: Member
 
 	return {
 		sessionManager: safeSessionManager,
-		model: handle.model,
-		routedModel: handle.routedModel,
-		state: handle.state ?? {
-			model: handle.model,
-			thinkingLevel: handle.thinkingLevel ?? "off",
+		get model() {
+			return handle.model;
 		},
-		modelRuntime: handle.modelRuntime ?? {
-			isUsingSubscription: () => false,
+		get routedModel() {
+			return handle.routedModel;
+		},
+		get state() {
+			return (
+				handle.state ?? {
+					model: handle.model,
+					thinkingLevel: handle.thinkingLevel ?? "off",
+				}
+			);
+		},
+		get modelRuntime() {
+			return (
+				handle.modelRuntime ?? {
+					isUsingSubscription: () => false,
+				}
+			);
 		},
 		getContextUsage: () => (typeof handle.getContextUsage === "function" ? handle.getContextUsage() : undefined),
 	} as unknown as AgentSession;

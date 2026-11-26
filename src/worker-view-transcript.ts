@@ -30,6 +30,7 @@ import {
 	ScrollView,
 	Spacer,
 	Text,
+	truncateToWidth,
 	type TUI,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
@@ -501,9 +502,9 @@ export class WorkerViewTranscriptController {
 				const isThumb = row >= thumbTop && row < thumbTop + thumbHeight;
 				const barChar = isThumb ? this.theme.fg("accent", "┃") : this.theme.fg("dim", "│");
 				const line = padded[row] ?? "";
-				const clipped = visibleWidth(line) > textWidth ? line.slice(0, textWidth) : line;
-				const padSpaces = " ".repeat(Math.max(0, textWidth - visibleWidth(clipped)));
-				padded[row] = `${clipped}${padSpaces}${barChar}`;
+				const clipped = truncateToWidth(line, textWidth, "", true);
+				const reset = clipped.includes("\x1b") ? "\x1b[0m" : "";
+				padded[row] = `${clipped}${reset}${barChar}`;
 			}
 		}
 
