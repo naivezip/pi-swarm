@@ -827,4 +827,46 @@ describe("SwarmWorkerViewComponent — Issue 05: Slash Commands & CombinedAutoco
 		expect(view.render(100).map(stripTerminalSequences).join("\n")).toContain("[read-only]");
 		view.dispose();
 	});
+
+	it("does not requestRender after closed via fallback Escape or mutate status after closed mid-abort", async () => {
+		const { mgr, ctx } = await setupSwarmWithWorker({ holdWorker: false });
+		const tui = makeFakeTui(24);
+		const minimalKeybindings = { matches: () => false } as unknown as typeof testKeybindings;
+		const done = vi.fn();
+		const view = new SwarmWorkerViewComponent(tui, testTheme, minimalKeybindings, mgr, ctx, "parser", done, {
+			throttleMs: 0,
+		});
+
+		const rendersBeforeEsc = (tui.requestRender as ReturnType<typeof vi.fn>).mock.calls.length;
+		view.handleInput("\x1b");
+		expect(done).toHaveBeenCalledWith(undefined);
+		expect((tui.requestRender as ReturnType<typeof vi.fn>).mock.calls.length).toBe(rendersBeforeEsc);
+
+		const { mgr: mgr2, ctx: ctx2 } = await setupSwarmWithWorker({ holdWorker: true });
+		let releaseAbort: (() => void) | undefined;
+		const origAbort = mgr2.abortWorkerByUser.bind(mgr2);
+		mgr2.abortWorkerByUser = async (name: string) => {
+			await new Promise<void>((resolve) => {
+				releaseAbort = resolve;
+			});
+			return origAbort(name);
+		};
+		const tui2 = makeFakeTui(24);
+		const done2 = vi.fn();
+		const view2 = new SwarmWorkerViewComponent(tui2, testTheme, testKeybindings, mgr2, ctx2, "parser", done2, {
+			throttleMs: 0,
+		});
+		view2.editor.setText("/abort");
+		view2.handleInput("\r");
+		for (let i = 0; i < 20 && !releaseAbort; i++) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+		expect(releaseAbort).toBeDefined();
+		const rendersAtClose = (tui2.requestRender as ReturnType<typeof vi.fn>).mock.calls.length;
+		view2.handleInput("\x04"); // Ctrl+D closes view mid-abort
+		expect(done2).toHaveBeenCalledWith(undefined);
+		releaseAbort!();
+		await new Promise((r) => setTimeout(r, 25));
+		expect((tui2.requestRender as ReturnType<typeof vi.fn>).mock.calls.length).toBe(rendersAtClose);
+	});
 });

@@ -2128,4 +2128,84 @@ describe("SwarmManager runtime mechanics", () => {
 		await expect(switchPromise).rejects.toThrow(/killed/);
 		expect(manager.getBoard().getMember("race-w")?.state).toBe("killed");
 	});
+
+	it("clears stranded queue and rejects if abortWorkerByUser or killWorkerByUser runs while async steer() awaits", async () => {
+		const cwd = makeTempDir("pi-swarm-async-steer-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-async-steer-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		let releaseSteerAbort: (() => void) | undefined;
+		let releaseSteerKill: (() => void) | undefined;
+
+		class SlowSteerSession extends MockWorkerSession {
+			steeringQueue: string[] = [];
+			private gate: (release: () => void) => void;
+
+			constructor(ctx: CreateWorkerSessionContext, gate: (release: () => void) => void) {
+				super(ctx, async () => {
+					await new Promise<void>(() => {});
+				});
+				this.gate = gate;
+			}
+
+			async steer(text: string): Promise<"queued"> {
+				await new Promise<void>((resolve) => {
+					this.gate(resolve);
+				});
+				this.steeringQueue.push(text);
+				return "queued";
+			}
+
+			getSteeringMessages(): readonly string[] {
+				return this.steeringQueue;
+			}
+
+			clearQueue(): { steering: string[]; followUp: string[] } {
+				const steering = [...this.steeringQueue];
+				this.steeringQueue = [];
+				return { steering, followUp: [] };
+			}
+		}
+
+		const manager = new SwarmManager({
+			sessionId: "sess-async-steer-race",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				if (ctx.member.name === "w-abort") {
+					return new SlowSteerSession(ctx, (r) => {
+						releaseSteerAbort = r;
+					});
+				}
+				return new SlowSteerSession(ctx, (r) => {
+					releaseSteerKill = r;
+				});
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "w-abort", brief: "Work" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "w-kill", brief: "Work 2" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		const abortSteerPromise = manager.sendDirectWorkerMessage("w-abort", "late-steer", "steer");
+		await waitForCondition(() => releaseSteerAbort !== undefined);
+		await manager.abortWorkerByUser("w-abort");
+		releaseSteerAbort!();
+		await expect(abortSteerPromise).rejects.toThrow(/stopped working/);
+		expect(manager.getBoard().getMember("w-abort")?.state).toBe("waiting");
+		expect(manager.getWorkerQueuedMessages("w-abort")).toEqual({ steering: [], followUp: [] });
+
+		const killEvents: string[] = [];
+		manager.subscribeWorkerEvents("w-kill", (ev) => killEvents.push(ev.type));
+		const killSteerPromise = manager.sendDirectWorkerMessage("w-kill", "dead-steer", "steer");
+		await waitForCondition(() => releaseSteerKill !== undefined);
+		await manager.killWorkerByUser("w-kill");
+		const eventsBeforeResolve = killEvents.length;
+		releaseSteerKill!();
+		await expect(killSteerPromise).rejects.toThrow(/killed/);
+		expect(killEvents.slice(eventsBeforeResolve)).not.toContain("queue_update");
+	});
 });

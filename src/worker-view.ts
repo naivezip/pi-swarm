@@ -553,12 +553,14 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 		this.refreshNow();
 		try {
 			const result = await this.manager.abortWorkerByUser(this.workerName);
+			if (this.closed) return;
 			this.setStatus(
 				result.aborted
 					? `Aborted ${this.workerName} (now ${result.state}).`
 					: `Worker "${this.workerName}" is already idle (${result.state}).`,
 			);
 		} catch (err) {
+			if (this.closed) return;
 			this.setStatus(`Abort failed: ${err instanceof Error ? err.message : String(err)}`, true);
 		}
 		this.refreshNow();
@@ -787,7 +789,9 @@ export class SwarmWorkerViewComponent implements Component, Focusable {
 			!this.editor.isShowingAutocomplete()
 		) {
 			this.handleEditorEscape();
-			this.tui.requestRender();
+			if (!this.closed) {
+				this.tui.requestRender();
+			}
 			return;
 		}
 

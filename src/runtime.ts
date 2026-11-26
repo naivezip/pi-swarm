@@ -1688,6 +1688,78 @@ export class SwarmManager {
 		});
 	}
 
+	private async queueDirectWorkerMessage(
+		name: string,
+		runtime: ActiveWorkerRuntime,
+		text: string,
+		delivery: "steer" | "followUp",
+	): Promise<void> {
+		const isFollowUp = delivery === "followUp";
+		const sessionFn = isFollowUp ? runtime.session.followUp : runtime.session.steer;
+		const tracked = isFollowUp ? runtime.trackedFollowUp : runtime.trackedSteering;
+		const fallback = isFollowUp ? runtime.fallbackQueuedFollowUp : runtime.fallbackQueuedSteering;
+		const hasNativeGetter = isFollowUp
+			? Boolean(runtime.session.getFollowUpMessages)
+			: Boolean(runtime.session.getSteeringMessages);
+
+		if (sessionFn) {
+			runtime.queueUpdateSeen = false;
+			const trackFallback = !hasNativeGetter;
+			if (trackFallback) {
+				tracked.push(text);
+			}
+			try {
+				await sessionFn.call(runtime.session, text);
+			} catch (err) {
+				if (trackFallback && !runtime.queueUpdateSeen) {
+					const idx = tracked.lastIndexOf(text);
+					if (idx !== -1) {
+						tracked.splice(idx, 1);
+					}
+				}
+				throw err;
+			}
+			const afterMember = this.board.getMember(name);
+			if (
+				this.disposed ||
+				this.stopping ||
+				!afterMember ||
+				afterMember.state === "killed" ||
+				!this.activeWorkers.has(name)
+			) {
+				runtime.trackedSteering.length = 0;
+				runtime.trackedFollowUp.length = 0;
+				runtime.fallbackQueuedSteering.length = 0;
+				runtime.fallbackQueuedFollowUp.length = 0;
+				runtime.session.clearQueue?.();
+				throw new Error(`Worker "${name}" was killed or stopped while queueing message.`);
+			}
+			if (runtime.abortRequestedByUser || afterMember.state !== "working") {
+				this.clearWorkerQueues(name, runtime);
+				throw new Error(`Worker "${name}" stopped working while queueing message.`);
+			}
+			if (!runtime.queueUpdateSeen) {
+				const queued = this.getWorkerQueuedMessages(name);
+				this.emitWorkerEvent(name, {
+					type: "queue_update",
+					steering: queued.steering,
+					followUp: queued.followUp,
+				});
+				this.emitSnapshot();
+			}
+			return;
+		}
+
+		fallback.push(text);
+		const queued = this.getWorkerQueuedMessages(name);
+		this.emitWorkerEvent(name, {
+			type: "queue_update",
+			steering: queued.steering,
+			followUp: queued.followUp,
+		});
+		this.emitSnapshot();
+	}
+
 	/**
 	 * Sends a strictly private message directly to a worker's session (zero board posts).
 	 * - `waiting`: prompts immediately
@@ -1781,83 +1853,9 @@ export class SwarmManager {
 		}
 
 		if (postResumeMember.state === "working" || this.wakingWorkers.has(name)) {
-			const effectiveDelivery: DirectWorkerMessageDelivery =
+			const effectiveDelivery: "steer" | "followUp" =
 				delivery === "followUp" ? "followUp" : "steer";
-			if (effectiveDelivery === "followUp") {
-				if (runtime.session.followUp) {
-					runtime.queueUpdateSeen = false;
-					const trackFallback = !runtime.session.getFollowUpMessages;
-					if (trackFallback) {
-						runtime.trackedFollowUp.push(text);
-					}
-					try {
-						await runtime.session.followUp(text);
-					} catch (err) {
-						if (trackFallback && !runtime.queueUpdateSeen) {
-							const idx = runtime.trackedFollowUp.lastIndexOf(text);
-							if (idx !== -1) {
-								runtime.trackedFollowUp.splice(idx, 1);
-							}
-						}
-						throw err;
-					}
-					if (!runtime.queueUpdateSeen) {
-						const queued = this.getWorkerQueuedMessages(name);
-						this.emitWorkerEvent(name, {
-							type: "queue_update",
-							steering: queued.steering,
-							followUp: queued.followUp,
-						});
-						this.emitSnapshot();
-					}
-				} else {
-					runtime.fallbackQueuedFollowUp.push(text);
-					const queued = this.getWorkerQueuedMessages(name);
-					this.emitWorkerEvent(name, {
-						type: "queue_update",
-						steering: queued.steering,
-						followUp: queued.followUp,
-					});
-					this.emitSnapshot();
-				}
-			} else {
-				if (runtime.session.steer) {
-					runtime.queueUpdateSeen = false;
-					const trackFallback = !runtime.session.getSteeringMessages;
-					if (trackFallback) {
-						runtime.trackedSteering.push(text);
-					}
-					try {
-						await runtime.session.steer(text);
-					} catch (err) {
-						if (trackFallback && !runtime.queueUpdateSeen) {
-							const idx = runtime.trackedSteering.lastIndexOf(text);
-							if (idx !== -1) {
-								runtime.trackedSteering.splice(idx, 1);
-							}
-						}
-						throw err;
-					}
-					if (!runtime.queueUpdateSeen) {
-						const queued = this.getWorkerQueuedMessages(name);
-						this.emitWorkerEvent(name, {
-							type: "queue_update",
-							steering: queued.steering,
-							followUp: queued.followUp,
-						});
-						this.emitSnapshot();
-					}
-				} else {
-					runtime.fallbackQueuedSteering.push(text);
-					const queued = this.getWorkerQueuedMessages(name);
-					this.emitWorkerEvent(name, {
-						type: "queue_update",
-						steering: queued.steering,
-						followUp: queued.followUp,
-					});
-					this.emitSnapshot();
-				}
-			}
+			await this.queueDirectWorkerMessage(name, runtime, text, effectiveDelivery);
 			return {
 				worker: name,
 				delivery: effectiveDelivery,
