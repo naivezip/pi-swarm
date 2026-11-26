@@ -1,25 +1,30 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type Api, type AssistantMessage, type Model, type ToolCall, uuidv7 } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, type ImageContent, type Model, type ToolCall, uuidv7 } from "@earendil-works/pi-ai";
 import {
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
 	type CompactionEntry,
+	type ContextUsage,
 	createAgentSession,
 	createMcpExtension,
 	CURRENT_SESSION_VERSION,
 	DefaultResourceLoader,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type ExtensionRunner,
 	getAgentDir,
+	type InputSource,
 	type ModelRegistry,
 	type ModelRuntime,
 	type PromptOptions,
+	type ResourceLoader,
 	type SessionEntry,
 	type SessionHeader,
 	SessionManager,
 	SettingsManager,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
 	doesMessageWakeCoordinator,
@@ -46,6 +51,7 @@ import {
 	type ManageTaskInput,
 	type ManageTaskResult,
 	type MemberRecord,
+	type MemberState,
 	type MemberStatusSummary,
 	type MemberUsage,
 	type ReadBoardOptions,
@@ -195,6 +201,26 @@ export interface RequestWaitResult {
 	notice: string;
 }
 
+export type DirectWorkerMessageDelivery = "prompt" | "steer" | "followUp";
+
+export interface DirectWorkerMessageResult {
+	worker: string;
+	delivery: DirectWorkerMessageDelivery;
+	resumed: boolean;
+	queued: boolean;
+	state: MemberState;
+}
+
+export interface WorkerQueuedMessages {
+	steering: readonly string[];
+	followUp: readonly string[];
+}
+
+export interface AbortWorkerResult {
+	aborted: boolean;
+	state: MemberState;
+}
+
 export interface WorkerSessionHandle {
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
@@ -203,10 +229,41 @@ export interface WorkerSessionHandle {
 	readonly isIdle: boolean;
 	readonly messages: AgentMessage[];
 	readonly sessionManager: ExtensionContext["sessionManager"];
+	readonly state?: { readonly model?: Model<Api>; readonly thinkingLevel?: ThinkingLevel };
+	readonly thinkingLevel?: ThinkingLevel;
+	readonly routedModel?: { model: Model<Api>; thinkingLevel?: ThinkingLevel };
+	readonly retryAttempt?: number;
+	readonly settingsManager?: SettingsManager;
+	readonly resourceLoader?: ResourceLoader;
+	readonly modelRuntime?: ModelRuntime;
+	readonly modelRegistry?: ModelRegistry;
+	readonly extensionRunner?: ExtensionRunner;
+	readonly scopedModels?: ReadonlyArray<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }>;
+	readonly autoCompactionEnabled?: boolean;
+	readonly pendingMessageCount?: number;
+	readonly sessionName?: string;
+	getContextUsage?(): ContextUsage | undefined;
+	getToolDefinition?(name: string): ToolDefinition | undefined;
+	getAvailableThinkingLevels?(): ThinkingLevel[];
+	setThinkingLevel?(level: ThinkingLevel, options?: { persist?: boolean }): void;
 	getActiveToolNames(): string[];
 	setActiveToolsByName(toolNames: string[]): void;
 	setModel(model: Model<Api>): Promise<void>;
 	prompt(text: string, options?: PromptOptions): Promise<void>;
+	steer?(
+		text: string,
+		images?: ImageContent[],
+		options?: { source?: InputSource },
+	): Promise<"handled" | "queued" | void>;
+	followUp?(
+		text: string,
+		images?: ImageContent[],
+		options?: { source?: InputSource },
+	): Promise<"handled" | "queued" | void>;
+	getSteeringMessages?(): readonly string[];
+	getFollowUpMessages?(): readonly string[];
+	clearQueue?(): { steering: string[]; followUp: string[] };
+	waitForIdle?(): Promise<void>;
 	abort(): Promise<void>;
 	dispose(): void;
 	subscribe(listener: AgentSessionEventListener): () => void;
@@ -251,6 +308,28 @@ interface ActiveWorkerRuntime {
 	activeTools: Set<string>;
 	explicitWaitCalledThisTurn: boolean;
 	lastTurnErrored: boolean;
+	abortRequestedByUser: boolean;
+	trackedSteering: string[];
+	trackedFollowUp: string[];
+	fallbackQueuedSteering: string[];
+	fallbackQueuedFollowUp: string[];
+	queueUpdateSeen: boolean;
+}
+
+function extractUserMessageText(message: AgentMessage): string {
+	if (message.role !== "user") {
+		return "";
+	}
+	if (typeof message.content === "string") {
+		return message.content;
+	}
+	if (!Array.isArray(message.content)) {
+		return "";
+	}
+	return message.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("");
 }
 
 function formatModelRef(model: Model<Api>): string {
@@ -532,6 +611,9 @@ export class SwarmManager {
 
 	private readonly activeWorkers = new Map<string, ActiveWorkerRuntime>();
 	private readonly wakingWorkers = new Set<string>();
+	private readonly resumingWorkers = new Map<string, Promise<ActiveWorkerRuntime>>();
+	private readonly abortRequestedBeforeSession = new Set<string>();
+	private readonly workerEventListeners = new Map<string, Set<AgentSessionEventListener>>();
 	private readonly pendingWorkerWakeSeq = new Map<string, number>();
 	private readonly pendingWorkerScheduleWake = new Map<string, ScheduledTaskRecord>();
 	private readonly pendingWorkerProcessEvents = new Map<string, BackgroundProcessEvent[]>();
@@ -741,6 +823,64 @@ export class SwarmManager {
 		}
 	}
 
+	/** Returns the live `WorkerSessionHandle` for an active worker, or `undefined` if stopped/killed. */
+	getWorkerSession(name: string): WorkerSessionHandle | undefined {
+		return this.activeWorkers.get(name)?.session;
+	}
+
+	/** Subscribes to live `AgentSessionEvent`s for a worker, automatically re-attaching across resume. */
+	subscribeWorkerEvents(name: string, listener: AgentSessionEventListener): () => void {
+		let set = this.workerEventListeners.get(name);
+		if (!set) {
+			set = new Set<AgentSessionEventListener>();
+			this.workerEventListeners.set(name, set);
+		}
+		set.add(listener);
+		return () => {
+			const listeners = this.workerEventListeners.get(name);
+			if (!listeners) {
+				return;
+			}
+			listeners.delete(listener);
+			if (listeners.size === 0) {
+				this.workerEventListeners.delete(name);
+			}
+		};
+	}
+
+	/** Returns pending private steering and follow-up messages queued for a worker. */
+	getWorkerQueuedMessages(name: string): WorkerQueuedMessages {
+		const runtime = this.activeWorkers.get(name);
+		if (!runtime) {
+			return { steering: [], followUp: [] };
+		}
+		const steering = runtime.session.getSteeringMessages
+			? [...runtime.session.getSteeringMessages()]
+			: runtime.trackedSteering.length > 0
+				? [...runtime.trackedSteering]
+				: [...runtime.fallbackQueuedSteering];
+		const followUp = runtime.session.getFollowUpMessages
+			? [...runtime.session.getFollowUpMessages()]
+			: runtime.trackedFollowUp.length > 0
+				? [...runtime.trackedFollowUp]
+				: [...runtime.fallbackQueuedFollowUp];
+		return { steering, followUp };
+	}
+
+	private emitWorkerEvent(name: string, event: AgentSessionEvent): void {
+		const listeners = this.workerEventListeners.get(name);
+		if (!listeners || listeners.size === 0) {
+			return;
+		}
+		for (const listener of [...listeners]) {
+			try {
+				listener(event);
+			} catch {
+				// Observer errors must not break worker session event processing.
+			}
+		}
+	}
+
 	/** Returns live streaming text and active tool names for a worker. */
 	getWorkerLiveActivity(name: string): WorkerLiveActivity {
 		const active = this.activeWorkers.get(name);
@@ -908,6 +1048,24 @@ export class SwarmManager {
 			uniqueCandidates.find((m) => m.id.toLowerCase() === lower);
 		if (exactMatch) {
 			return exactMatch;
+		}
+
+		if (this.modelRuntime) {
+			if (slashIdx > 0) {
+				const provider = trimmed.slice(0, slashIdx);
+				const id = trimmed.slice(slashIdx + 1);
+				const rtModel = this.modelRuntime.getModel(provider, id);
+				if (rtModel) {
+					return rtModel;
+				}
+			}
+			const rtAvailable = [...this.modelRuntime.getAvailableSnapshot()];
+			const rtMatch =
+				rtAvailable.find((m) => `${m.provider}/${m.id}`.toLowerCase() === lower) ??
+				rtAvailable.find((m) => m.id.toLowerCase() === lower);
+			if (rtMatch) {
+				return rtMatch;
+			}
 		}
 
 		throw new Error(`Model "${modelRef}" not found or unavailable in registry.`);
@@ -1240,6 +1398,12 @@ export class SwarmManager {
 			activeTools: new Set<string>(),
 			explicitWaitCalledThisTurn: false,
 			lastTurnErrored: false,
+			abortRequestedByUser: false,
+			trackedSteering: [],
+			trackedFollowUp: [],
+			fallbackQueuedSteering: [],
+			fallbackQueuedFollowUp: [],
+			queueUpdateSeen: false,
 		};
 
 		runtime.unsubscribe = session.subscribe((event) => {
@@ -1248,6 +1412,25 @@ export class SwarmManager {
 
 		this.activeWorkers.set(member.name, runtime);
 		return runtime;
+	}
+
+	private async ensureActiveWorkerRuntime(member: MemberRecord): Promise<ActiveWorkerRuntime> {
+		const existing = this.activeWorkers.get(member.name);
+		if (existing) {
+			return existing;
+		}
+		const inFlight = this.resumingWorkers.get(member.name);
+		if (inFlight) {
+			return inFlight;
+		}
+		const model = member.model ? this.resolveModelBestEffort(member.model) : undefined;
+		const promise = this.createAndStartWorkerSession(member, model).finally(() => {
+			if (this.resumingWorkers.get(member.name) === promise) {
+				this.resumingWorkers.delete(member.name);
+			}
+		});
+		this.resumingWorkers.set(member.name, promise);
+		return promise;
 	}
 
 	private handleWorkerSessionEvent(
@@ -1268,6 +1451,30 @@ export class SwarmManager {
 				runtime.streamingText = "";
 				this.board.saveState();
 				this.emitSnapshot();
+				break;
+			}
+			case "queue_update": {
+				runtime.queueUpdateSeen = true;
+				runtime.trackedSteering = [...event.steering];
+				runtime.trackedFollowUp = [...event.followUp];
+				this.emitSnapshot();
+				break;
+			}
+			case "message_start": {
+				if (event.message.role === "user" && !runtime.session.getSteeringMessages) {
+					const msgText = extractUserMessageText(event.message);
+					const steerIdx = runtime.trackedSteering.indexOf(msgText);
+					if (steerIdx !== -1) {
+						runtime.trackedSteering.splice(steerIdx, 1);
+						this.emitSnapshot();
+					} else {
+						const followIdx = runtime.trackedFollowUp.indexOf(msgText);
+						if (followIdx !== -1) {
+							runtime.trackedFollowUp.splice(followIdx, 1);
+							this.emitSnapshot();
+						}
+					}
+				}
 				break;
 			}
 			case "tool_execution_start": {
@@ -1319,6 +1526,8 @@ export class SwarmManager {
 			default:
 				break;
 		}
+
+		this.emitWorkerEvent(memberName, event);
 	}
 
 	private enqueuePendingProcessEvent(memberName: string, event: BackgroundProcessEvent): void {
@@ -1327,11 +1536,13 @@ export class SwarmManager {
 		this.pendingWorkerProcessEvents.set(memberName, queue);
 	}
 
-	private onWorkerSettled(member: MemberRecord, runtime: ActiveWorkerRuntime, _aborted: boolean): void {
+	private onWorkerSettled(member: MemberRecord, runtime: ActiveWorkerRuntime, aborted: boolean): void {
 		if (this.disposed || member.state === "killed") {
 			return;
 		}
 
+		const wasAborted = aborted || runtime.abortRequestedByUser;
+		runtime.abortRequestedByUser = false;
 		runtime.streamingText = "";
 		runtime.activeTools.clear();
 		member.currentActivity = undefined;
@@ -1342,12 +1553,44 @@ export class SwarmManager {
 		}
 		runtime.explicitWaitCalledThisTurn = false;
 		member.state = "waiting";
+		if (wasAborted) {
+			runtime.lastTurnErrored = false;
+			member.lastError = undefined;
+		}
 		this.board.saveState();
 		this.emitSnapshot();
 
-		if (runtime.lastTurnErrored) {
-			// Failed turns sit out until a new board post, model switch, or next scheduled tick,
-			// preserving any queued board/schedule/process wakes for recovery.
+		if (wasAborted || runtime.lastTurnErrored) {
+			if (wasAborted) {
+				this.pendingWorkerWakeSeq.delete(member.name);
+				this.pendingWorkerScheduleWake.delete(member.name);
+				this.pendingWorkerProcessEvents.delete(member.name);
+				this.scheduler.notifyWorkerIdle(member.name);
+			}
+			// Aborted or failed turns sit out until a new wake/prompt/model-switch arrives.
+			return;
+		}
+
+		const nextDirectText =
+			runtime.fallbackQueuedSteering.shift() ?? runtime.fallbackQueuedFollowUp.shift();
+		if (nextDirectText !== undefined) {
+			this.emitWorkerEvent(member.name, {
+				type: "queue_update",
+				steering: [...runtime.fallbackQueuedSteering],
+				followUp: [...runtime.fallbackQueuedFollowUp],
+			});
+			this.emitSnapshot();
+			queueMicrotask(() => {
+				const current = this.board.getMember(member.name);
+				if (this.disposed || this.stopping || !current || current.state !== "waiting") {
+					return;
+				}
+				current.state = "working";
+				current.lastError = undefined;
+				this.board.saveState();
+				this.emitSnapshot();
+				this.launchWorkerPrompt(member.name, nextDirectText);
+			});
 			return;
 		}
 
@@ -1400,6 +1643,9 @@ export class SwarmManager {
 			if (!member || member.state === "killed") {
 				return;
 			}
+			if (runtime.abortRequestedByUser || member.state !== "working") {
+				return;
+			}
 			runtime.lastTurnErrored = true;
 			member.lastError = err instanceof Error ? err.message : String(err);
 			member.currentActivity = undefined;
@@ -1407,6 +1653,250 @@ export class SwarmManager {
 			this.board.saveState();
 			this.emitSnapshot();
 		});
+	}
+
+	/**
+	 * Sends a strictly private message directly to a worker's session (zero board posts).
+	 * - `waiting`: prompts immediately
+	 * - `working`: queues as `steer` (default) or `followUp`
+	 * - `stopped`: resumes persisted session, re-attaches live events, and prompts
+	 * - `killed`: throws a read-only error
+	 */
+	async sendDirectWorkerMessage(
+		name: string,
+		text: string,
+		delivery?: DirectWorkerMessageDelivery,
+	): Promise<DirectWorkerMessageResult> {
+		if (this.disposed || this.stopping) {
+			throw new Error("SwarmManager is stopping or disposed.");
+		}
+		if (!text || text.trim().length === 0) {
+			throw new Error("Direct worker message requires non-empty text.");
+		}
+		const member = this.board.getMember(name);
+		if (!member) {
+			throw new Error(`Worker "${name}" does not exist.`);
+		}
+		if (member.state === "killed") {
+			throw new Error(`Worker "${name}" has been killed and is read-only.`);
+		}
+
+		let resumed = false;
+		let runtime = this.activeWorkers.get(name);
+		if (!runtime) {
+			const inFlight = this.resumingWorkers.get(name);
+			if (inFlight) {
+				await inFlight.catch(() => {});
+				runtime = this.activeWorkers.get(name);
+			}
+		}
+
+		const postResumeMember = this.board.getMember(name);
+		if (!postResumeMember || postResumeMember.state === "killed") {
+			throw new Error(`Worker "${name}" has been killed and is read-only.`);
+		}
+
+		if (!runtime) {
+			resumed = true;
+			this.wakingWorkers.add(name);
+			postResumeMember.state = "working";
+			postResumeMember.lastError = undefined;
+			this.board.saveState();
+			this.emitSnapshot();
+			try {
+				runtime = await this.ensureActiveWorkerRuntime(postResumeMember);
+				if (this.disposed || this.stopping || this.board.getMember(name)?.state === "killed") {
+					throw new Error(`Worker "${name}" was killed or stopped during session resume.`);
+				}
+				if (this.abortRequestedBeforeSession.delete(name)) {
+					postResumeMember.state = "waiting";
+					postResumeMember.currentActivity = undefined;
+					this.board.saveState();
+					this.emitSnapshot();
+					return {
+						worker: name,
+						delivery: "prompt",
+						resumed: true,
+						queued: false,
+						state: postResumeMember.state,
+					};
+				}
+				runtime.lastTurnErrored = false;
+				runtime.abortRequestedByUser = false;
+				this.emitSnapshot();
+				this.launchWorkerPrompt(name, text);
+				return {
+					worker: name,
+					delivery: "prompt",
+					resumed: true,
+					queued: false,
+					state: this.board.getMember(name)?.state ?? "waiting",
+				};
+			} catch (err) {
+				const current = this.board.getMember(name);
+				if (current && current.state !== "killed" && !this.disposed && !this.stopping) {
+					current.state = this.activeWorkers.has(name) ? "waiting" : "stopped";
+					current.currentActivity = undefined;
+					current.lastError = err instanceof Error ? err.message : String(err);
+					this.board.saveState();
+					this.emitSnapshot();
+				}
+				throw err;
+			} finally {
+				this.wakingWorkers.delete(name);
+			}
+		}
+
+		if (postResumeMember.state === "working" || this.wakingWorkers.has(name)) {
+			const effectiveDelivery: DirectWorkerMessageDelivery =
+				delivery === "followUp" ? "followUp" : "steer";
+			if (effectiveDelivery === "followUp") {
+				if (runtime.session.followUp) {
+					runtime.queueUpdateSeen = false;
+					if (!runtime.session.getFollowUpMessages) {
+						runtime.trackedFollowUp.push(text);
+					}
+					await runtime.session.followUp(text);
+					if (!runtime.queueUpdateSeen) {
+						const queued = this.getWorkerQueuedMessages(name);
+						this.emitWorkerEvent(name, {
+							type: "queue_update",
+							steering: queued.steering,
+							followUp: queued.followUp,
+						});
+						this.emitSnapshot();
+					}
+				} else {
+					runtime.fallbackQueuedFollowUp.push(text);
+					const queued = this.getWorkerQueuedMessages(name);
+					this.emitWorkerEvent(name, {
+						type: "queue_update",
+						steering: queued.steering,
+						followUp: queued.followUp,
+					});
+					this.emitSnapshot();
+				}
+			} else {
+				if (runtime.session.steer) {
+					runtime.queueUpdateSeen = false;
+					if (!runtime.session.getSteeringMessages) {
+						runtime.trackedSteering.push(text);
+					}
+					await runtime.session.steer(text);
+					if (!runtime.queueUpdateSeen) {
+						const queued = this.getWorkerQueuedMessages(name);
+						this.emitWorkerEvent(name, {
+							type: "queue_update",
+							steering: queued.steering,
+							followUp: queued.followUp,
+						});
+						this.emitSnapshot();
+					}
+				} else {
+					runtime.fallbackQueuedSteering.push(text);
+					const queued = this.getWorkerQueuedMessages(name);
+					this.emitWorkerEvent(name, {
+						type: "queue_update",
+						steering: queued.steering,
+						followUp: queued.followUp,
+					});
+					this.emitSnapshot();
+				}
+			}
+			return {
+				worker: name,
+				delivery: effectiveDelivery,
+				resumed,
+				queued: true,
+				state: this.board.getMember(name)?.state ?? "working",
+			};
+		}
+
+		// Worker is waiting with a live session attached -> prompt immediately
+		postResumeMember.state = "working";
+		postResumeMember.lastError = undefined;
+		runtime.lastTurnErrored = false;
+		runtime.abortRequestedByUser = false;
+		this.board.saveState();
+		this.emitSnapshot();
+		this.launchWorkerPrompt(name, text);
+		return {
+			worker: name,
+			delivery: "prompt",
+			resumed,
+			queued: false,
+			state: this.board.getMember(name)?.state ?? "waiting",
+		};
+	}
+
+	/**
+	 * Aborts only the specified worker's running turn without affecting Coordinator or peers.
+	 * Safe no-op (`{ aborted: false, state }`) when the worker is already idle/stopped/killed.
+	 */
+	async abortWorkerByUser(name: string): Promise<AbortWorkerResult> {
+		const member = this.board.getMember(name);
+		if (!member) {
+			throw new Error(`Worker "${name}" does not exist.`);
+		}
+		if (member.state !== "working" && !this.wakingWorkers.has(name)) {
+			return { aborted: false, state: member.state };
+		}
+
+		let runtime = this.activeWorkers.get(name);
+		if (!runtime) {
+			this.abortRequestedBeforeSession.add(name);
+			const pendingResume = this.resumingWorkers.get(name);
+			if (pendingResume) {
+				await pendingResume.catch(() => {});
+			}
+			runtime = this.activeWorkers.get(name);
+			if (!runtime) {
+				this.abortRequestedBeforeSession.delete(name);
+				const refreshed = this.board.getMember(name);
+				if (refreshed && refreshed.state === "working") {
+					refreshed.state = "waiting";
+					refreshed.currentActivity = undefined;
+					this.board.saveState();
+					this.emitSnapshot();
+				}
+				return { aborted: true, state: refreshed?.state ?? "waiting" };
+			}
+		}
+
+		runtime.abortRequestedByUser = true;
+		const hadFallbackQueue =
+			runtime.fallbackQueuedSteering.length > 0 || runtime.fallbackQueuedFollowUp.length > 0;
+		runtime.fallbackQueuedSteering.length = 0;
+		runtime.fallbackQueuedFollowUp.length = 0;
+		if (hadFallbackQueue) {
+			const queued = this.getWorkerQueuedMessages(name);
+			this.emitWorkerEvent(name, {
+				type: "queue_update",
+				steering: queued.steering,
+				followUp: queued.followUp,
+			});
+		}
+
+		try {
+			await runtime.session.abort();
+		} catch {
+			// Ignore abort errors and settle worker state cleanly.
+		}
+
+		const current = this.board.getMember(name);
+		if (!current || current.state === "killed") {
+			runtime.abortRequestedByUser = false;
+			return { aborted: true, state: current?.state ?? "killed" };
+		}
+		if (current.state === "working") {
+			this.onWorkerSettled(current, runtime, true);
+		} else {
+			runtime.abortRequestedByUser = false;
+		}
+		return {
+			aborted: true,
+			state: this.board.getMember(name)?.state ?? "waiting",
+		};
 	}
 
 	/** Posts a message to the board and evaluates wakeups for all non-killed members and coordinator. */
@@ -1682,15 +2172,19 @@ export class SwarmManager {
 		this.emitSnapshot();
 
 		try {
-			let runtime = this.activeWorkers.get(memberName);
-			if (!runtime) {
-				const model = member.model ? this.resolveModelBestEffort(member.model) : undefined;
-				runtime = await this.createAndStartWorkerSession(member, model);
-			}
+			const runtime = await this.ensureActiveWorkerRuntime(member);
 			if (this.disposed || this.stopping || this.board.getMember(memberName)?.state === "killed") {
 				return;
 			}
+			if (this.abortRequestedBeforeSession.delete(memberName)) {
+				member.state = "waiting";
+				member.currentActivity = undefined;
+				this.board.saveState();
+				this.emitSnapshot();
+				return;
+			}
 			runtime.lastTurnErrored = false;
+			runtime.abortRequestedByUser = false;
 
 			const promptText = this.formatWakePrompt(member, reason);
 			this.launchWorkerPrompt(memberName, promptText);
@@ -1698,7 +2192,7 @@ export class SwarmManager {
 			if (this.disposed || this.stopping || this.board.getMember(memberName)?.state === "killed") {
 				return;
 			}
-			member.state = "waiting";
+			member.state = this.activeWorkers.has(memberName) ? "waiting" : "stopped";
 			member.lastError = err instanceof Error ? err.message : String(err);
 			this.board.saveState();
 			this.emitSnapshot();
@@ -1901,6 +2395,7 @@ export class SwarmManager {
 			this.pendingWorkerWakeSeq.delete(target.name);
 			this.pendingWorkerScheduleWake.delete(target.name);
 			this.pendingWorkerProcessEvents.delete(target.name);
+			this.abortRequestedBeforeSession.delete(target.name);
 			this.board.upsertMember(target);
 		}
 
@@ -2209,6 +2704,7 @@ export class SwarmManager {
 		this.pendingWorkerWakeSeq.clear();
 		this.pendingWorkerScheduleWake.clear();
 		this.pendingWorkerProcessEvents.clear();
+		this.abortRequestedBeforeSession.clear();
 		this.pendingCoordinatorWake = undefined;
 
 		for (const [name, runtime] of this.activeWorkers.entries()) {
@@ -2236,5 +2732,6 @@ export class SwarmManager {
 		state.coordinator.state = "waiting";
 		this.board.saveState();
 		this.listeners.clear();
+		this.workerEventListeners.clear();
 	}
 }

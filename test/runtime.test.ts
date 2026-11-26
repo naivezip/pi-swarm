@@ -237,7 +237,7 @@ class MockWorkerSession implements WorkerSessionHandle {
 		};
 	}
 
-	private emit(event: AgentSessionEvent): void {
+	protected emit(event: AgentSessionEvent): void {
 		for (const listener of this.listeners) {
 			listener(event);
 		}
@@ -1508,5 +1508,502 @@ describe("SwarmManager runtime mechanics", () => {
 		const secondSession = createdSessions[1];
 		expect(secondSession.disposed).toBe(true);
 		expect(secondSession.prompts).toEqual([]);
+	});
+
+	it("sends private direct messages to waiting workers with zero board posts and relays live events", async () => {
+		const cwd = makeTempDir("pi-swarm-direct-wait-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-direct-wait-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		const sessions = new Map<string, MockWorkerSession>();
+		const manager = new SwarmManager({
+			sessionId: "sess-direct-wait",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				const session = new MockWorkerSession(ctx, (promptText, s) => {
+					s.emitToolEvent("read", { path: "README.md" });
+					s.emitAssistantSuccess(`reply to: ${promptText}`);
+				});
+				sessions.set(ctx.member.name, session);
+				return session;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "coder", brief: "Initial brief" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+
+		const headBefore = manager.getBoard().head;
+		const boardCountBefore = manager.getMessages().length;
+		expect(manager.getWorkerSession("coder")).toBe(sessions.get("coder"));
+
+		const receivedEvents: AgentSessionEvent[] = [];
+		const unsubscribeEvents = manager.subscribeWorkerEvents("coder", (ev) => {
+			receivedEvents.push(ev);
+		});
+		const snapshots: Array<{ state: string; turns: number }> = [];
+		const unsubscribeSnap = manager.subscribe((snap) => {
+			const m = snap.members.find((x) => x.name === "coder");
+			if (m) {
+				snapshots.push({ state: m.state, turns: m.usage.turns });
+			}
+		});
+
+		const result = await manager.sendDirectWorkerMessage("coder", "Explain your diff privately");
+		expect(result.worker).toBe("coder");
+		expect(result.delivery).toBe("prompt");
+		expect(result.resumed).toBe(false);
+		expect(result.queued).toBe(false);
+		await flushMicrotasks();
+
+		// Strictly private: zero board posts
+		expect(manager.getBoard().head).toBe(headBefore);
+		expect(manager.getMessages()).toHaveLength(boardCountBefore);
+
+		// Live session events relayed and usage/state updated
+		expect(receivedEvents.some((e) => e.type === "agent_start")).toBe(true);
+		expect(receivedEvents.some((e) => e.type === "message_update")).toBe(true);
+		expect(receivedEvents.some((e) => e.type === "tool_execution_start")).toBe(true);
+		expect(receivedEvents.some((e) => e.type === "agent_settled")).toBe(true);
+		expect(sessions.get("coder")?.prompts).toContain("Explain your diff privately");
+		expect(manager.getBoard().getMember("coder")?.state).toBe("waiting");
+		expect(manager.getBoard().getMember("coder")?.usage.turns).toBe(2);
+		expect(snapshots.some((s) => s.state === "working")).toBe(true);
+		expect(snapshots[snapshots.length - 1]).toEqual({ state: "waiting", turns: 2 });
+
+		await expect(manager.sendDirectWorkerMessage("coder", "   ")).rejects.toThrow(/non-empty/);
+		await expect(manager.sendDirectWorkerMessage("missing", "hi")).rejects.toThrow(/does not exist/);
+
+		unsubscribeEvents();
+		unsubscribeSnap();
+	});
+
+	it("queues steer (default) and followUp when working with both native queue hooks and fallback queue", async () => {
+		const cwd = makeTempDir("pi-swarm-queue-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-queue-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		class QueueAwareSession extends MockWorkerSession {
+			private steeringQueue: string[] = [];
+			private followUpQueue: string[] = [];
+
+			async steer(text: string): Promise<"handled" | "queued"> {
+				this.steeringQueue.push(text);
+				this.emit({
+					type: "queue_update",
+					steering: [...this.steeringQueue],
+					followUp: [...this.followUpQueue],
+				});
+				return "queued";
+			}
+
+			async followUp(text: string): Promise<"handled" | "queued"> {
+				this.followUpQueue.push(text);
+				this.emit({
+					type: "queue_update",
+					steering: [...this.steeringQueue],
+					followUp: [...this.followUpQueue],
+				});
+				return "queued";
+			}
+
+			getSteeringMessages(): readonly string[] {
+				return this.steeringQueue;
+			}
+
+			getFollowUpMessages(): readonly string[] {
+				return this.followUpQueue;
+			}
+
+			drainQueuedForTest(): string[] {
+				const consumed: string[] = [];
+				while (this.steeringQueue.length > 0) {
+					const next = this.steeringQueue.shift()!;
+					consumed.push(next);
+					this.emit({
+						type: "queue_update",
+						steering: [...this.steeringQueue],
+						followUp: [...this.followUpQueue],
+					});
+					const msg: AgentMessage = { role: "user", content: [{ type: "text", text: next }], timestamp: Date.now() };
+					this.sessionManager.appendMessage(msg);
+					this.emit({ type: "message_start", message: msg });
+					this.emit({ type: "message_end", message: msg });
+				}
+				while (this.followUpQueue.length > 0) {
+					const next = this.followUpQueue.shift()!;
+					consumed.push(next);
+					this.emit({
+						type: "queue_update",
+						steering: [...this.steeringQueue],
+						followUp: [...this.followUpQueue],
+					});
+					const msg: AgentMessage = { role: "user", content: [{ type: "text", text: next }], timestamp: Date.now() };
+					this.sessionManager.appendMessage(msg);
+					this.emit({ type: "message_start", message: msg });
+					this.emit({ type: "message_end", message: msg });
+				}
+				return consumed;
+			}
+		}
+
+		let releaseNativeTurn: (() => void) | undefined;
+		let releaseFallbackTurn: (() => void) | undefined;
+		const nativeConsumed: string[] = [];
+		const fallbackSessions = new Map<string, MockWorkerSession>();
+		const nativeSessions = new Map<string, QueueAwareSession>();
+
+		const manager = new SwarmManager({
+			sessionId: "sess-queue",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				if (ctx.member.name === "native-w") {
+					let turn = 0;
+					const s = new QueueAwareSession(ctx, async (_p, sess) => {
+						turn += 1;
+						if (turn === 1) {
+							await new Promise<void>((resolve) => {
+								releaseNativeTurn = resolve;
+							});
+						}
+						nativeConsumed.push(...(sess as QueueAwareSession).drainQueuedForTest());
+						sess.emitAssistantSuccess("native-ok");
+					});
+					nativeSessions.set(ctx.member.name, s);
+					return s;
+				}
+				let turn = 0;
+				const s = new MockWorkerSession(ctx, async (_p, sess) => {
+					turn += 1;
+					if (turn === 1) {
+						await new Promise<void>((resolve) => {
+							releaseFallbackTurn = resolve;
+						});
+					}
+					sess.emitAssistantSuccess(`fallback-${turn}`);
+				});
+				fallbackSessions.set(ctx.member.name, s);
+				return s;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "native-w", brief: "Work 1" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "fallback-w", brief: "Work 2" }, "coordinator", hostCtx);
+		await waitForCondition(() => releaseNativeTurn !== undefined && releaseFallbackTurn !== undefined);
+
+		const headBefore = manager.getBoard().head;
+		const nativeQueueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
+		manager.subscribeWorkerEvents("native-w", (ev) => {
+			if (ev.type === "queue_update") {
+				nativeQueueEvents.push({ steering: [...ev.steering], followUp: [...ev.followUp] });
+			}
+		});
+
+		// Default delivery while working is "steer"
+		const r1 = await manager.sendDirectWorkerMessage("native-w", "steer-1");
+		expect(r1).toMatchObject({ worker: "native-w", delivery: "steer", resumed: false, queued: true, state: "working" });
+		const r2 = await manager.sendDirectWorkerMessage("native-w", "followup-1", "followUp");
+		expect(r2).toMatchObject({
+			worker: "native-w",
+			delivery: "followUp",
+			resumed: false,
+			queued: true,
+			state: "working",
+		});
+
+		expect(manager.getWorkerQueuedMessages("native-w")).toEqual({
+			steering: ["steer-1"],
+			followUp: ["followup-1"],
+		});
+		expect(nativeQueueEvents.length).toBeGreaterThanOrEqual(2);
+
+		// Fallback mock session (without steer/followUp methods) also tracks and drains queues
+		const f1 = await manager.sendDirectWorkerMessage("fallback-w", "fb-steer");
+		const f2 = await manager.sendDirectWorkerMessage("fallback-w", "fb-follow", "followUp");
+		expect(f1.delivery).toBe("steer");
+		expect(f1.queued).toBe(true);
+		expect(f2.delivery).toBe("followUp");
+		expect(f2.queued).toBe(true);
+		expect(manager.getWorkerQueuedMessages("fallback-w")).toEqual({
+			steering: ["fb-steer"],
+			followUp: ["fb-follow"],
+		});
+
+		// Release both turns and verify queues drain to empty without touching board
+		releaseNativeTurn!();
+		releaseFallbackTurn!();
+		await waitForCondition(
+			() =>
+				manager.getBoard().getMember("native-w")?.state === "waiting" &&
+				manager.getBoard().getMember("fallback-w")?.state === "waiting" &&
+				fallbackSessions.get("fallback-w")!.prompts.length === 3,
+		);
+
+		expect(nativeConsumed).toEqual(["steer-1", "followup-1"]);
+		expect(manager.getWorkerQueuedMessages("native-w")).toEqual({ steering: [], followUp: [] });
+		expect(fallbackSessions.get("fallback-w")!.prompts.slice(1)).toEqual(["fb-steer", "fb-follow"]);
+		expect(manager.getWorkerQueuedMessages("fallback-w")).toEqual({ steering: [], followUp: [] });
+		expect(manager.getBoard().head).toBe(headBefore);
+	});
+
+	it("auto-resumes stopped worker on direct message, re-attaches live events, and rejects killed workers", async () => {
+		const cwd = makeTempDir("pi-swarm-direct-resume-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-direct-resume-root-");
+		const modelA = makeModel("p", "a");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA], SessionManager.inMemory(cwd));
+
+		const manager = new SwarmManager({
+			sessionId: "sess-direct-resume",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) =>
+				new MockWorkerSession(ctx, (p, s) => {
+					s.emitAssistantSuccess(`initial:${p}`);
+				}),
+		});
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "editor", brief: "Initial brief" }, "coordinator", hostCtx);
+		await flushMicrotasks();
+		manager.dispose();
+
+		// Reload from disk -> worker is stopped, no live session
+		const resumedSessions = new Map<string, MockWorkerSession>();
+		const recovered = SwarmManager.loadIfExists({
+			sessionId: "sess-direct-resume",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				const s = new MockWorkerSession(ctx, (p, sess) => {
+					sess.emitAssistantSuccess(`resumed:${p}`);
+				});
+				resumedSessions.set(ctx.member.name, s);
+				return s;
+			},
+		})!;
+		managersToDispose.push(recovered);
+		recovered.updateHostContext(hostCtx);
+
+		expect(recovered.getBoard().getMember("editor")?.state).toBe("stopped");
+		expect(recovered.getWorkerSession("editor")).toBeUndefined();
+
+		// Subscribe BEFORE auto-resume while worker is still stopped
+		const eventsBeforeKill: AgentSessionEvent[] = [];
+		recovered.subscribeWorkerEvents("editor", (ev) => {
+			eventsBeforeKill.push(ev);
+		});
+
+		const headBefore = recovered.getBoard().head;
+		const res = await recovered.sendDirectWorkerMessage("editor", "Continue privately");
+		expect(res.resumed).toBe(true);
+		expect(res.delivery).toBe("prompt");
+		expect(res.queued).toBe(false);
+		await flushMicrotasks();
+
+		// Zero board posts, live session attached, pre-registered listener received events
+		expect(recovered.getBoard().head).toBe(headBefore);
+		expect(recovered.getWorkerSession("editor")).toBe(resumedSessions.get("editor"));
+		expect(recovered.getBoard().getMember("editor")?.state).toBe("waiting");
+		expect(eventsBeforeKill.some((e) => e.type === "agent_start")).toBe(true);
+		expect(eventsBeforeKill.some((e) => e.type === "message_update")).toBe(true);
+		expect(eventsBeforeKill.some((e) => e.type === "agent_settled")).toBe(true);
+
+		// Kill worker -> read-only enforcement
+		const killSnapshots: string[] = [];
+		recovered.subscribe((snap) => {
+			const m = snap.members.find((x) => x.name === "editor");
+			if (m) killSnapshots.push(m.state);
+		});
+		await recovered.killWorkerByUser("editor");
+		expect(killSnapshots[killSnapshots.length - 1]).toBe("killed");
+		expect(recovered.getWorkerSession("editor")).toBeUndefined();
+		expect(recovered.getWorkerQueuedMessages("editor")).toEqual({ steering: [], followUp: [] });
+		expect(recovered.getWorkerMessages("editor").length).toBeGreaterThan(0);
+
+		await expect(recovered.sendDirectWorkerMessage("editor", "After kill")).rejects.toThrow(/killed|read-only/i);
+		expect(recovered.getBoard().head).toBe(headBefore);
+	});
+
+	it("aborts only the targeted working worker without affecting coordinator or peer workers, and safely no-ops on idle", async () => {
+		const cwd = makeTempDir("pi-swarm-abort-iso-cwd-");
+		const swarmsRoot = makeTempDir("pi-swarm-abort-iso-root-");
+		const modelA = makeModel("p", "a");
+		const modelB = makeModel("p", "b");
+		const hostCtx = makeFakeExtensionContext(cwd, modelA, [modelA, modelB], SessionManager.inMemory(cwd));
+
+		let releaseW1: (() => void) | undefined;
+		let releaseW2: (() => void) | undefined;
+		const sessions = new Map<string, MockWorkerSession>();
+
+		const manager = new SwarmManager({
+			sessionId: "sess-abort-iso",
+			cwd,
+			swarmsRoot,
+			sessionFactory: async (ctx) => {
+				const session = new MockWorkerSession(ctx, async (_p, s) => {
+					if (ctx.member.name === "w1") {
+						await new Promise<void>((resolve) => {
+							releaseW1 = resolve;
+						});
+					} else if (ctx.member.name === "w2") {
+						await new Promise<void>((resolve) => {
+							releaseW2 = resolve;
+						});
+						s.emitAssistantSuccess("w2 finished undisturbed");
+					} else {
+						s.emitAssistantSuccess("idle ready");
+					}
+				});
+				sessions.set(ctx.member.name, session);
+				return session;
+			},
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		// Coordinator is actively working
+		manager.onCoordinatorRunStart();
+		await manager.addWorkers({ name: "w1", brief: "Long task 1" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "w2", brief: "Long task 2" }, "coordinator", hostCtx);
+		await manager.addWorkers({ name: "w3", brief: "Idle worker" }, "coordinator", hostCtx);
+		await waitForCondition(() => releaseW1 !== undefined && releaseW2 !== undefined);
+		await flushMicrotasks();
+
+		// Queue a board post to w1 while working to verify abort does not auto-restart a loop
+		manager.postMessage("coordinator", "@w1 extra post");
+
+		// Cannot switch model while working
+		await expect(manager.switchWorkerModelByUser("w1", "p/b")).rejects.toThrow(/while it is working/);
+
+		// Abort ONLY w1
+		const abortRes = await manager.abortWorkerByUser("w1");
+		expect(abortRes).toEqual({ aborted: true, state: "waiting" });
+		expect(sessions.get("w1")?.abortedCount).toBe(1);
+		expect(manager.getBoard().getMember("w1")?.state).toBe("waiting");
+		expect(manager.getBoard().getMember("w1")?.lastError).toBeUndefined();
+		expect(sessions.get("w1")?.prompts).toHaveLength(1);
+
+		// Coordinator and w2 are completely unaffected
+		expect(manager.getBoard().getState().coordinator.state).toBe("working");
+		expect(manager.getBoard().getMember("w2")?.state).toBe("working");
+		expect(sessions.get("w2")?.abortedCount).toBe(0);
+
+		// Now w1 is waiting -> can switch model cleanly and emits snapshot
+		let switchedModelSnap: string | undefined;
+		manager.subscribe((snap) => {
+			switchedModelSnap = snap.members.find((m) => m.name === "w1")?.model;
+		});
+		const switchRes = await manager.switchWorkerModelByUser("w1", "p/b");
+		expect(switchRes.model).toBe("p/b");
+		expect(switchedModelSnap).toBe("p/b");
+
+		// Safe non-error no-op on already-idle waiting and killed workers
+		expect(await manager.abortWorkerByUser("w3")).toEqual({ aborted: false, state: "waiting" });
+		await manager.killWorkerByUser("w3");
+		expect(await manager.abortWorkerByUser("w3")).toEqual({ aborted: false, state: "killed" });
+		await expect(manager.switchWorkerModelByUser("w3", "p/a")).rejects.toThrow(/killed/);
+
+		// Unblock w2 and verify it completes normally
+		releaseW2!();
+		releaseW1!();
+		await waitForCondition(() => manager.getBoard().getMember("w2")?.state === "waiting");
+		expect(manager.getBoard().getMember("w2")?.usage.turns).toBe(1);
+	});
+
+	it("E2E real AgentSession supports getWorkerSession capabilities, private direct steer/followUp, and single-worker abort", async () => {
+		const cwd = makeTempDir("pi-swarm-e2e-direct-cwd-");
+		const agentDir = makeTempDir("pi-swarm-e2e-direct-agent-");
+		const swarmsRoot = makeTempDir("pi-swarm-e2e-direct-root-");
+
+		const faux = registerFauxProvider({
+			models: [{ id: "faux-direct-1", name: "Faux Direct", reasoning: false }],
+		});
+		extraCleanups.push(() => faux.unregister());
+
+		const fauxModel = faux.getModel();
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+		});
+		await modelRuntime.setRuntimeApiKey(fauxModel.provider, "faux-key");
+		modelRuntime.registerProvider(fauxModel.provider, {
+			baseUrl: fauxModel.baseUrl,
+			api: fauxModel.api,
+			models: [
+				{
+					id: fauxModel.id,
+					name: fauxModel.name,
+					api: fauxModel.api,
+					reasoning: fauxModel.reasoning,
+					input: fauxModel.input,
+					cost: fauxModel.cost,
+					contextWindow: fauxModel.contextWindow,
+					maxTokens: fauxModel.maxTokens,
+					baseUrl: fauxModel.baseUrl,
+				},
+			],
+		});
+
+		const coordSm = SessionManager.inMemory(cwd);
+		const available = [...modelRuntime.getAvailableSnapshot()];
+		const hostCtx = makeFakeExtensionContext(cwd, fauxModel as Model<Api>, available as Model<Api>[], coordSm);
+
+		faux.setResponses([
+			fauxAssistantMessage("Initial turn complete."),
+			fauxAssistantMessage("Private answer received."),
+		]);
+
+		const manager = new SwarmManager({
+			sessionId: "sess-e2e-direct",
+			cwd,
+			agentDir,
+			swarmsRoot,
+			modelRuntime,
+		});
+		managersToDispose.push(manager);
+		manager.updateHostContext(hostCtx);
+
+		await manager.addWorkers({ name: "helper", brief: "Ready" }, "coordinator", hostCtx);
+		await waitForCondition(() => manager.getBoard().getMember("helper")?.state === "waiting", 6000);
+
+		const session = manager.getWorkerSession("helper");
+		expect(session).toBeDefined();
+		expect(session?.state).toBeDefined();
+		expect(session?.settingsManager).toBeDefined();
+		expect(session?.resourceLoader).toBeDefined();
+		expect(session?.modelRuntime).toBeDefined();
+		expect(session?.extensionRunner).toBeDefined();
+		expect(typeof session?.getContextUsage).toBe("function");
+		expect(typeof session?.steer).toBe("function");
+		expect(typeof session?.followUp).toBe("function");
+		expect(typeof session?.getSteeringMessages).toBe("function");
+		expect(typeof session?.getFollowUpMessages).toBe("function");
+
+		const headBefore = manager.getBoard().head;
+		const events: AgentSessionEvent[] = [];
+		manager.subscribeWorkerEvents("helper", (ev) => events.push(ev));
+
+		await manager.sendDirectWorkerMessage("helper", "Hello privately");
+		await waitForCondition(
+			() =>
+				manager.getBoard().getMember("helper")?.state === "waiting" &&
+				events.some((e) => e.type === "agent_settled"),
+			6000,
+		);
+
+		expect(manager.getBoard().head).toBe(headBefore);
+		expect(manager.getWorkerMessages("helper").some((m) => JSON.stringify(m).includes("Private answer received."))).toBe(
+			true,
+		);
+
+		// Idle abort is a safe no-op
+		expect(await manager.abortWorkerByUser("helper")).toEqual({ aborted: false, state: "waiting" });
 	});
 });
