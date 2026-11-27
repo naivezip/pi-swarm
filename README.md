@@ -2,39 +2,120 @@
 
 English | [简体中文](./README.zh.md)
 
-Inspired by Antigravity's swarm, built for Pi.
+## What does this do?
 
-Multi-agent swarm orchestration package for Pi (`@earendil-works/pi-coding-agent`), providing a shared message board, in-process SDK workers, isolated git workspaces, an async background shell with process management, a stall monitor scheduler, and an interactive TUI board overlay.
-
-## Demo
-
-Recorded live in Pi on WSL using `magpie / workbuddy/deepseek-v4.1-flash` (`math` + `strings` editing disjoint files in parallel, `verifier` extending tests and running `npm test` 11/11 pass, live TUI status widget, and `Alt+S` 3-tab Board Overlay):
+Turns a single [Pi](https://pi.dev) coding session into a coordinated multi-agent swarm—parallel workers in isolated git workspaces, a shared `@mention` message board, non-blocking background shells, and a live TUI dashboard. *(Inspired by Antigravity's swarm, built natively for `@earendil-works/pi-coding-agent`.)*
 
 ![pi-swarm live demo](https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo.gif)
 
-[Download / watch full MP4 recording](https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo.mp4)
+<sub>Recorded live in Pi (`math` + `strings` editing disjoint files in parallel, `verifier` extending and running `npm test` 11/11 pass, live TUI status widget, and `Alt+S` Board Overlay) · <a href="https://raw.githubusercontent.com/naivezip/pi-swarm/main/assets/demo.mp4">Watch full MP4</a></sub>
 
-## Install
+## Why should I care?
 
-Published on [pi.dev](https://pi.dev) and npm as `@naivezip/pi-swarm`.
+- **Parallelize real repo work without git collisions** — Single-agent sessions bottleneck on multi-module tasks, while naive subagents overwrite each other's working tree. `pi-swarm` isolates workers in git worktrees (`share`) or clones (`branch`) so multiple agents edit, build, and verify concurrently.
+- **Peer-to-peer coordination without polling waste** — Instead of routing every handoff through a bloated parent context or burning tokens in sleep loops, workers coordinate directly on `#main` and topic `#channels`, parking at zero cost (`swarm_wait`) until `@mention`ed.
+- **Long builds and dev servers never freeze a worker** — Workers get an async-promoting `bash` shell (`manage_process`): quick commands return inline, while long test runs or daemons promote seamlessly to the background and wake the worker on exit—watched by a read-only `monitor` scheduler that catches stalls.
+- **Full TUI visibility & hot model switching (zero overhead when off)** — Swarm tools register with `defaultActive: false`, adding **zero prompt or tool tokens** to normal Pi sessions. When active, inspect plans, board feeds, background processes, and live transcripts—or hot-swap a rate-limited worker's model without losing its conversation history.
 
-Install globally via Pi's package manager:
+## How do I use it?
+
+### 1. Kick off a swarm in one command
+
+```text
+/swarm Implement math and string utilities in parallel, then have a verifier expand and run the test suite
+```
+
+Pi enables coordinator mode, breaks your goal into parallel threads, spawns workers in isolated git workspaces, and wakes the coordinator automatically as workers report back.
+
+### 2. Watch and steer live (`Alt+S`)
+
+While a swarm runs, a compact widget above your prompt tracks worker states (`working`, `waiting`, `stopped`, `killed`), active background processes (`N bg`), and cumulative tokens/cost.
+
+Press **`Alt+S`** (or run `/swarm ui`) anytime to open the **3-tab Swarm Board Overlay**:
+
+- **`1` Overview** — Structured `plan.json` view (`goal`, `threads`, assigned worker states, and `[N bg]` process badges). Press `Enter` on any worker to jump straight into its session.
+- **`2` Board** — Scrollable message feed with `@mention` highlights, channel/member filters (`c` / `m`), and `r` / `Enter` to prefill `#<seq> ` into the coordinator input.
+- **`3` Workers** — Worker roster + live transcript and `Background Processes` inspector (`taskId`, `[daemon]`, `elapsed` / `silent` durations), plus `M` (switch model when idle), `k` (confirm & kill), `S` (stop all running workers), or `Enter` to open **Worker View**.
+- **Full-screen Worker View (`Enter`)** — Interact directly with an individual worker: `Enter` to prompt or steer mid-turn, `Alt+Enter` to queue a follow-up, `Ctrl+O` / `Ctrl+T` to toggle tool output or thinking blocks, `/model`, `/abort`, `/kill`, `/exit` slash commands, `Alt+S` to return to the board, or `Ctrl+D` to return to the coordinator.
+
+*(Non-TUI `print` / `json` / `rpc` modes automatically fall back to clean plain-text summaries.)*
+
+### 3. Commands & shortcuts
+
+| Command / Key | What it does |
+| :--- | :--- |
+| `/swarm <task>` | Enable coordinator mode, inject swarm skills, and start orchestrating `<task>` |
+| `/swarm` | Open the Swarm Board Overlay if a swarm exists; otherwise enable coordinator mode |
+| `/swarm ui` / `Alt+S` | Open the 3-tab Swarm Board Overlay |
+| `/swarm stop` | Abort all running workers and their background processes (keeps history & workspaces) |
+| `/swarm off` | Exit coordinator mode and remove swarm tools from active tools |
+| `/swarm clean` | Remove stale swarm worktrees/clones from previous sessions under `~/.pi/agent/swarms/` |
+
+<details>
+<summary><strong>Under the hood: Agent Tools, Skills & Architecture</strong></summary>
+
+#### Swarm & Worker Tools
+
+Coordinator and worker sessions share four core tools (`post_message`, `read_board`, and `swarm_wait` activate for the coordinator once the first worker is added or restored):
+
+- `swarm` — Manage the swarm (`status`, `models`, `add`, `model`, `kill`, `title`, `channel`, `plan`):
+  - `add`: Spawn a worker or sharded/homogeneous group (`tasks` / `n`), with optional `model`, `workspace` (`inherit` | `share` | `branch`), `fork` (`"coordinator"` or worker name), and `channels`.
+  - `model`: Switch a `waiting`/`stopped` worker's (or own) model while preserving history and resuming unfinished turns.
+  - `kill`: Permanently terminate a worker or group, kill its background process trees, and delete its `share`/`branch` workspace.
+  - `channel`: `create`, `list`, `subscribe`, `unsubscribe`, `archive`.
+  - `plan`: Persist structured goal/threads/tasks in `plan.json` for the TUI Overview tab.
+- `post_message` — Post to `#main` or a subscribed channel; `@name`, `@group`, `@all`, and `@#channel` wake recipients (code-block mentions ignored; `@#main` refused).
+- `read_board` — Read visible board messages (`since`, `limit`, `channel`, or `status: true` for roster, cursor, and background process diagnostics).
+- `swarm_wait` — Non-blocking park (`since`, `mentions_only`) that wakes asynchronously on the next matching post.
+
+Worker-specific tools:
+
+- **Non-monitor workers (`bash` + `manage_process`)** — Replaces blocking `bash` with sync-to-async promotion (`wait_ms` default `10000`, max `30000`; `is_daemon`; `notify_after_seconds` default `120`). Commands exceeding `wait_ms` keep running in the background (`taskId` + output tail) and wake the worker on `process_exit` or `process_still_running`. `manage_process` (`list`, `status`, `send_input`, `kill`) enforces per-worker isolation and full process-tree termination.
+- **Monitor workers (`schedule` + `manage_task`)** — Strictly read-only (`monitor` / `monitor-<N>`); runs one-shot timers (`DurationSeconds`) or 5-field crons (`CronExpression`, `IsDaemon`) to detect and unstick stalled workers.
+
+#### Bundled Skills
+
+- `swarm` (`skills/swarm/SKILL.md`) — Coordinator orchestration guide (delegation, workspaces, channels, addressing, non-blocking waiting, rate-limit recovery).
+- `swarm-monitor` (`skills/swarm-monitor/SKILL.md`) — Stall-detection protocol distinguishing active background builds from stuck silent processes and daemons.
+- `swarm-pane` (`skills/swarm-pane/SKILL.md`) — `plan.json` schema for the TUI Overview tab.
+
+#### Architecture
+
+- `extensions/index.ts` — Pi extension entry point (`defaultActive: false` tools, `/swarm` command, `Alt+S` shortcut, session restore/shutdown lifecycle, queued coordinator wakeups).
+- `src/runtime.ts` — `SwarmManager` managing in-process `createAgentSession` workers, branch-safe session forking, non-blocking parks, and async wakeups.
+- `src/board.ts` — Append-only `board.jsonl`, atomic `state.json` & `plan.json` persistence under `~/.pi/agent/swarms/<sessionId>/`, channel visibility, and `@mention` wake matching.
+- `src/workspace.ts` — Git worktree (`share`), local git clone (`branch`), `inherit`, and stale workspace cleanup.
+- `src/process-manager.ts` — `BackgroundProcessManager` with sync-to-async promotion, rolling tail buffers + log spillover, silence tracking, stdin delivery, and cross-platform process-tree termination.
+- `src/scheduler.ts` — 5-field cron and one-shot timer engine for monitor workers.
+- `src/ui.ts` & `src/worker-view*.ts` — Throttled TUI widget, 3-tab Swarm Board Overlay, full-screen interactive Worker View, and plain-text fallbacks.
+- `docs/specs/` — Design docs and Quint formal specs (`async_background_shell.qnt`, `swarm_worker_view.qnt`).
+
+</details>
+
+## How do I install it?
+
+Published on [pi.dev](https://pi.dev) and npm as `@naivezip/pi-swarm` (requires Pi and Node.js `>= 22.19.0`).
+
+**Try it for a single session first** (no config changes):
+
+```bash
+pi -e npm:@naivezip/pi-swarm
+```
+
+**Install globally** via Pi's package manager:
 
 ```bash
 pi install npm:@naivezip/pi-swarm
 ```
 
-Install project-locally (adds to `.pi/settings.json`):
+**Or install per-project** (writes to `.pi/settings.json`):
 
 ```bash
 pi install -l npm:@naivezip/pi-swarm
 ```
 
-Try for a single session without saving to settings:
-
-```bash
-pi -e npm:@naivezip/pi-swarm
-```
+<details>
+<summary>Update, uninstall, or run from source</summary>
 
 Manage installed packages:
 
@@ -44,7 +125,7 @@ pi update
 pi remove npm:@naivezip/pi-swarm
 ```
 
-Secondary options (GitHub or local development checkout):
+Install from GitHub or a local checkout:
 
 ```bash
 pi install git:github.com/naivezip/pi-swarm
@@ -52,74 +133,11 @@ pi install ./path/to/pi-swarm
 pi -e ./path/to/pi-swarm
 ```
 
-## Commands & Shortcut
-
-Swarm tools are registered with `defaultActive: false` so normal Pi sessions incur zero prompt or tool overhead until activated.
-
-- `/swarm <task>`: Enables coordinator mode, activates the `swarm` tool, injects coordinator (`swarm`, `swarm-pane`) skill guidance, and sends `<task>` to the coordinator.
-- `/swarm`: Opens the interactive Swarm Board Overlay if a swarm exists for the current session; otherwise enables coordinator mode (`swarm` tool).
-- `/swarm ui`: Opens the 3-tab Swarm Board Overlay (or prints a plain-text summary in non-TUI modes).
-- `/swarm stop`: Aborts all currently running workers and terminates their background processes without deleting their histories or workspaces.
-- `/swarm off`: Deactivates coordinator mode and removes all 4 swarm tools from active tools (warns if workers are still running).
-- `/swarm clean`: Removes stale swarm worktrees and clones from other sessions under `~/.pi/agent/swarms/`.
-- `Alt+S`: Keyboard shortcut to open the Swarm Board Overlay when a swarm is active.
-
-## Tools
-
-Coordinator and worker sessions share four core tools (`post_message`, `read_board`, and `swarm_wait` activate for the coordinator as soon as the first worker is added or on session restore):
-
-- `swarm`: Manage the swarm (`status`, `models`, `add`, `model`, `kill`, `title`, `channel`, `plan`).
-  - `add`: Spawn a worker or sharded/homogeneous group (`tasks` / `n`), with optional `model`, `workspace` (`inherit` | `share` | `branch`), `fork` (`"coordinator"` or worker name), and `channels`.
-  - `model`: Switch a `waiting` worker's (or own) model while preserving conversation history and resuming unfinished/errored turns.
-  - `kill`: Permanently terminate a worker or group, clean up its background processes, and delete its `share`/`branch` workspace.
-  - `channel`: `create`, `list`, `subscribe`, `unsubscribe`, `archive`.
-  - `plan`: Persist structured goal/threads/tasks in `plan.json` for the TUI Overview tab.
-- `post_message`: Post to `#main` or a subscribed channel; `@name`, `@group`, `@all`, and `@#channel` wake recipients (mentions inside code blocks are ignored; `@#main` is refused).
-- `read_board`: Read visible board messages (`since`, `limit`, `channel`, or `status: true` for detailed roster, cursor, and active background process diagnostics).
-- `swarm_wait`: Non-blocking park (`since`, `mentions_only`). Returns immediately if matching unread posts exist; otherwise registers the wait cursor so the host/runtime wakes the caller asynchronously on the next matching post.
-
-Non-monitor workers receive an async background shell instead of Pi's blocking default `bash`:
-
-- `bash`: Runs commands with sync-to-async promotion (`wait_ms`, default `10000`, max `30000`; `is_daemon`; `notify_after_seconds`, default `120`). Commands exiting within `wait_ms` return synchronously; longer commands promote to the background without being killed, return a `taskId` and output tail, and wake the owning worker asynchronously on `process_exit` or non-daemon `process_still_running`.
-- `manage_process`: Inspect and control the worker's own background processes (`list`, `status`, `send_input`, `kill`), enforcing strict owner isolation and full process-tree termination.
-
-Monitor workers (`monitor` or `monitor-<N>`) stay strictly read-only (no `bash`, `powershell`, `edit`, `write`, or `manage_process`) and receive:
-
-- `schedule`: Create one-shot timers (`DurationSeconds`) or 5-field crons (`CronExpression`, `IsDaemon`).
-- `manage_task`: List or kill scheduled monitor tasks.
-
-## Skills
-
-- `swarm` (`skills/swarm/SKILL.md`): Coordinator orchestration guide (delegation, workspaces, channels, addressing, non-blocking waiting, quota/rate-limit recovery).
-- `swarm-monitor` (`skills/swarm-monitor/SKILL.md`): Stall-detection protocol for `monitor` workers, including distinguishing active non-daemon background builds from long-silent stuck processes and daemons.
-- `swarm-pane` (`skills/swarm-pane/SKILL.md`): Concise `plan.json` structure for the TUI Overview tab.
-
-## TUI Widget & Overlay
-
-- **Persistent Widget** (`ctx.ui.setWidget("pi-swarm", ...)`): Displays swarm title, channel/post count, total active background processes (`N bg`), live worker states (`working`, `waiting`, `stopped`, `killed`), per-worker background process summaries (`N bg ([daemon] <preview>, <elapsed>)`), current tool activity or error tags, cumulative tokens/cost, and shortcut hint (`Alt+S` / `/swarm`).
-- **Interactive Overlay** (`ctx.ui.custom(..., { overlay: true })`):
-  - **Overview (`1`)**: Renders `plan.json` (`goal`, `threads`, assigned `tasks` with live worker status and `[N bg: ...]` badges) or falls back to a live roster and channels summary.
-  - **Board (`2`)**: Scrollable feed with `@mention` highlighting, channel filter (`c`), member filter (`m`), and `r` / `Enter` to prefill `#<seq> ` into the coordinator editor.
-  - **Workers (`3`)**: Worker list (with `[N bg]` badges) + live transcript, `Background Processes (N):` detail section (`taskId`, `[daemon]` tag, command, `elapsed` / `silent` durations), and safe actions: `k` (confirm & kill), `M` (switch model when waiting), `S` (stop all running workers).
-  - Press `1`/`2`/`3`, `Tab`/`Shift+Tab`, or `Left`/`Right` to switch tabs; `Esc` or `q` to close.
-- **Plain-Text Fallback**: Non-TUI modes (`print` / `json` / `rpc`) render a structured summary including `bg=N` counts and active process lines.
-
-## Architecture
-
-- `src/types.ts`: Canonical state, board, plan, scheduler, and background process types.
-- `src/board.ts`: Append-only `board.jsonl`, atomic `state.json` and `plan.json` persistence under `~/.pi/agent/swarms/<sessionId>/`, channel visibility, and wake matching.
-- `src/workspace.ts`: Git worktree (`share`), local git clone (`branch`), `inherit`, and stale workspace cleanup.
-- `src/scheduler.ts`: 5-field cron and one-shot timer engine for monitor workers.
-- `src/process-manager.ts`: `BackgroundProcessManager` providing sync-to-async `bash` promotion, rolling tail buffers with temp-file spillover, silence tracking, stdin delivery, cross-platform process-tree killing (`taskkill` on Windows, process groups on Unix), and owner-scoped lifecycle cleanup.
-- `src/runtime.ts`: `SwarmManager` managing in-process `createAgentSession` workers, `DefaultResourceLoader({ noExtensions: true, extensionFactories: [createMcpExtension(), workerExtension] })`, branch-safe session forking, non-blocking parks, background process events (`process_exit` / `process_still_running`), and async wakeups.
-- `src/tools.ts`: TypeBox tool definitions (`swarm`, `post_message`, `read_board`, `swarm_wait`, `schedule`, `manage_task`, `bash`, `manage_process`) and TUI call/result renderers.
-- `src/ui.ts`: Throttled TUI widget, 3-tab interactive overlay with background process indicators, and non-TUI plain-text fallback.
-- `extensions/index.ts`: Pi extension entry point (`defaultActive: false` tools, `/swarm` command, `Alt+S` shortcut, session restore/shutdown lifecycle, queued coordinator wakeup).
-- `docs/specs/async_background_shell.qnt` & `docs/specs/async-background-shell.md`: Design spec and Quint formal specification verifying async background shell promotion, worker ownership/wake state machines, and coordinator wake delivery.
-
-## Development
+Local development checks:
 
 ```bash
 npm run typecheck
 npm test
 ```
+
+</details>
