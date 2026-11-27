@@ -38,11 +38,14 @@
 	},
 	"scripts": {
 		"typecheck": "node ../pi/node_modules/typescript/bin/tsc --noEmit",
-		"test": "node ../pi/node_modules/vitest/vitest.mjs run"
+		"test": "node ../pi/node_modules/vitest/vitest.mjs run",
+		"check": "biome check .",
+		"format": "biome format --write .",
+		"prepare": "lefthook install"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
@@ -50,5 +53,9 @@
 	"engines": {
 		"node": ">=22.19.0"
 	},
-	"license": "MIT"
+	"license": "MIT",
+	"devDependencies": {
+		"@biomejs/biome": "^2.6.9",
+		"lefthook": "^2.2.3"
+	}
 }
